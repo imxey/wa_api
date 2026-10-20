@@ -34,8 +34,18 @@ function matches(value, expected) {
 
 const isValidSecret = (secret) => matches(secret, process.env.SECRET_KEY);
 
+// Short passwords are too easy to guess even with the lockout below
+const MIN_PASSWORD_LENGTH = 12;
+if ((process.env.ADMIN_PASSWORD || "").length < MIN_PASSWORD_LENGTH) {
+  console.log(`[auth] ADMIN_PASSWORD kosong/kurang dari ${MIN_PASSWORD_LENGTH} karakter, halaman QR dikunci`);
+}
+if ((process.env.SECRET_KEY || "").length < MIN_PASSWORD_LENGTH) {
+  console.log(`[auth] PERINGATAN: SECRET_KEY kurang dari ${MIN_PASSWORD_LENGTH} karakter, ganti dengan yang acak dan panjang`);
+}
+
 // QR page uses Basic Auth with its own credentials, separate from the API key
 function isAuthorizedPage(req) {
+  if ((process.env.ADMIN_PASSWORD || "").length < MIN_PASSWORD_LENGTH) return false;
   const [scheme, encoded] = (req.headers.authorization || "").split(" ");
   if (scheme !== "Basic" || !encoded) return false;
   const decoded = Buffer.from(encoded, "base64").toString();
@@ -45,6 +55,45 @@ function isAuthorizedPage(req) {
     matches(decoded.slice(i + 1), process.env.ADMIN_PASSWORD)
   );
 }
+
+// Brute-force guard: every 401 counts against the caller's IP; too many and the IP is locked out.
+// ponytail: in-memory, resets on restart; move to Redis if this ever runs as several instances
+const MAX_FAILS = 10;
+const WINDOW_MS = 15 * 60 * 1000;
+const failures = new Map(); // ip -> { count, since, until }
+
+function clientIp(req) {
+  // Behind a reverse proxy every request comes from the proxy's IP, so trust the
+  // entry it appends (the last one); earlier entries are client-controlled
+  if (process.env.TRUST_PROXY === "1" && req.headers["x-forwarded-for"]) {
+    return req.headers["x-forwarded-for"].split(",").pop().trim();
+  }
+  return req.socket.remoteAddress;
+}
+
+function lockedFor(ip) {
+  const until = failures.get(ip)?.until || 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
+function recordFail(ip) {
+  const now = Date.now();
+  let f = failures.get(ip);
+  if (!f || now - f.since > WINDOW_MS) f = { count: 0, since: now, until: 0 };
+  if (++f.count >= MAX_FAILS) {
+    f.until = now + WINDOW_MS;
+    console.log(`[auth] ${ip} dikunci ${WINDOW_MS / 60000} menit setelah ${MAX_FAILS} gagal login`);
+  }
+  failures.set(ip, f);
+}
+
+// Drop stale entries so random IPs can't grow the map forever
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, f] of failures) {
+    if (f.until < now && now - f.since > WINDOW_MS) failures.delete(ip);
+  }
+}, WINDOW_MS).unref();
 
 const phoneOf = (sock) => String(sock?.user?.id || "").split(/[:@]/)[0] || null;
 
@@ -213,6 +262,15 @@ async function handleLogout(req, res) {
 function startWebServer() {
   http
     .createServer(async (req, res) => {
+      const ip = clientIp(req);
+      const wait = lockedFor(ip);
+      if (wait) {
+        res.writeHead(429, { "Retry-After": String(wait) });
+        return res.end("Too Many Requests: terlalu banyak percobaan login, coba lagi nanti");
+      }
+      // One hook covers every auth path (/send, /status, /logout, QR page)
+      res.on("finish", () => res.statusCode === 401 && recordFail(ip));
+
       try {
         if (req.method === "POST" && req.url === "/send") {
           return await handleSend(req, res);
