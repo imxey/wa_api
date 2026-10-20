@@ -1,4 +1,5 @@
 require("dotenv").config();
+const fs = require("fs");
 const http = require("http");
 const crypto = require("crypto");
 const {
@@ -11,17 +12,41 @@ const QRCode = require("qrcode");
 
 const PORT = process.env.PORT || 8086;
 
-let currentQr = "";
-let waSocket = null;
-let waReady = false;
+// First account is the default for requests without `akun`
+const ACCOUNTS = (process.env.WA_ACCOUNTS || "utama")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+// Names become folder names under auth/, so no path tricks allowed
+for (const id of ACCOUNTS) {
+  if (!/^[a-z0-9_-]+$/i.test(id)) throw new Error(`Nama akun tidak valid: ${id}`);
+}
+const accounts = new Map(
+  ACCOUNTS.map((id) => [id, { sock: null, qr: "", ready: false }]),
+);
 
 // Hash both sides so timingSafeEqual gets equal-length buffers
-function isValidSecret(secret) {
-  const expected = process.env.SECRET_KEY;
-  if (!expected || typeof secret !== "string") return false;
+function matches(value, expected) {
+  if (!expected || typeof value !== "string") return false;
   const hash = (s) => crypto.createHash("sha256").update(s).digest();
-  return crypto.timingSafeEqual(hash(secret), hash(expected));
+  return crypto.timingSafeEqual(hash(value), hash(expected));
 }
+
+const isValidSecret = (secret) => matches(secret, process.env.SECRET_KEY);
+
+// QR page uses Basic Auth with its own credentials, separate from the API key
+function isAuthorizedPage(req) {
+  const [scheme, encoded] = (req.headers.authorization || "").split(" ");
+  if (scheme !== "Basic" || !encoded) return false;
+  const decoded = Buffer.from(encoded, "base64").toString();
+  const i = decoded.indexOf(":");
+  return (
+    matches(decoded.slice(0, i), process.env.ADMIN_USER) &&
+    matches(decoded.slice(i + 1), process.env.ADMIN_PASSWORD)
+  );
+}
+
+const phoneOf = (sock) => String(sock?.user?.id || "").split(/[:@]/)[0] || null;
 
 function toJid(nomor) {
   if (String(nomor).includes("@")) return String(nomor);
@@ -75,34 +100,47 @@ async function handleSend(req, res) {
     data.secretKey ||
     data.kodeRahasia;
   const file = data.file instanceof File ? data.file : null;
+  const acc = accounts.get(data.akun || data.account || ACCOUNTS[0]);
 
   if (!isValidSecret(secret)) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  if (!acc) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
   }
   if (!nomor || (!msg && !file)) {
     return sendJson(res, 400, {
       error: "Bad Request: nomor and message or file are required",
     });
   }
-  if (!waSocket || !waReady) {
+  if (!acc.sock || !acc.ready) {
     return sendJson(res, 503, { error: "WhatsApp socket not ready" });
   }
 
-  await waSocket.sendMessage(toJid(nomor), await buildContent(file, msg));
+  await acc.sock.sendMessage(toJid(nomor), await buildContent(file, msg));
   sendJson(res, 200, { success: true, message: "Pesan berhasil dikirim!" });
 }
 
 async function renderQrPage(res) {
-  const qrImage = currentQr
-    ? await QRCode.toDataURL(currentQr, { margin: 1, scale: 8 })
-    : "";
-  const body = waReady
-    ? `<p>✅ WhatsApp connected</p>`
-    : qrImage
-      ? `<img src="${qrImage}" alt="QR Code" />`
-      : `<p>Menunggu QR dari WhatsApp...</p>`;
+  const cards = await Promise.all(
+    ACCOUNTS.map(async (id) => {
+      const { qr, ready, sock } = accounts.get(id);
+      const body = ready
+        ? `<p>Tersambung: ${phoneOf(sock)}</p>
+           <form method="post" action="/logout/${id}" onsubmit="return confirm('Logout ${id} dari WhatsApp?')">
+             <button type="submit">Logout</button>
+           </form>`
+        : qr
+          ? `<img src="${await QRCode.toDataURL(qr, { margin: 1, scale: 8 })}" alt="QR ${id}" />`
+          : `<p>Menunggu QR dari WhatsApp...</p>`;
+      return `<div class="card"><h2>${id}</h2>${body}</div>`;
+    }),
+  );
 
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
   res.end(`<!doctype html>
 <html>
   <head>
@@ -111,80 +149,126 @@ async function renderQrPage(res) {
     <meta http-equiv="refresh" content="5" />
     <title>WhatsApp QR Login</title>
     <style>
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-        font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
-      .card { text-align: center; background: #111827; padding: 24px; border-radius: 16px; }
-      img { width: 320px; height: 320px; image-rendering: pixelated; background: #fff;
-        padding: 12px; border-radius: 12px; }
+      body { margin: 0; min-height: 100vh; font-family: system-ui, sans-serif;
+        background: #0f172a; color: #e2e8f0; text-align: center; }
+      .grid { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; padding: 16px; }
+      .card { background: #111827; padding: 24px; border-radius: 16px; }
+      img { width: 320px; max-width: 100%; image-rendering: pixelated; background: #fff;
+        padding: 12px; border-radius: 12px; box-sizing: border-box; }
+      button { background: #dc2626; color: #fff; border: 0; padding: 8px 20px;
+        border-radius: 8px; font: inherit; cursor: pointer; }
     </style>
   </head>
   <body>
-    <div class="card">
-      <h1>WhatsApp QR</h1>
-      ${body}
-      <p>Refresh otomatis tiap 5 detik.</p>
-    </div>
+    <h1>WhatsApp QR</h1>
+    <div class="grid">${cards.join("")}</div>
+    <p>Refresh otomatis tiap 5 detik.</p>
   </body>
 </html>`);
+}
+
+// Status semua akun untuk aplikasi pemanggil (header X-Secret-Key). QR hanya untuk akun yang belum tersambung.
+async function handleStatus(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const akun = await Promise.all(
+    ACCOUNTS.map(async (id) => {
+      const { qr, ready, sock } = accounts.get(id);
+      return {
+        akun: id,
+        ready,
+        nomor: ready ? phoneOf(sock) : null,
+        qr: !ready && qr ? await QRCode.toDataURL(qr, { margin: 1, scale: 6 }) : null,
+      };
+    }),
+  );
+  sendJson(res, 200, { default: ACCOUNTS[0], akun });
+}
+
+// POST /logout/<akun>: X-Secret-Key from the calling app, or the Logout button on the QR page
+async function handleLogout(req, res) {
+  const viaApi = isValidSecret(req.headers["x-secret-key"]);
+  // Browsers resend Basic Auth on their own, so the button also requires same-origin (blocks CSRF)
+  const viaPage =
+    isAuthorizedPage(req) && req.headers["sec-fetch-site"] === "same-origin";
+  if (!viaApi && !viaPage) {
+    return sendJson(res, 401, { error: "Unauthorized" });
+  }
+  const acc = accounts.get(decodeURIComponent(req.url.slice("/logout/".length)));
+  if (!acc) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
+  }
+  if (!acc.ready) {
+    return sendJson(res, 409, { error: "Akun belum tersambung" });
+  }
+
+  // Ends with a loggedOut close, which wipes auth/<akun> and brings up a fresh QR
+  await acc.sock.logout();
+  if (viaApi) return sendJson(res, 200, { success: true });
+  res.writeHead(303, { Location: "/" });
+  res.end();
 }
 
 function startWebServer() {
   http
     .createServer(async (req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader(
-        "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Secret-Key",
-      );
-
       try {
-        if (req.method === "OPTIONS") {
-          res.writeHead(200);
-          return res.end();
-        }
         if (req.method === "POST" && req.url === "/send") {
           return await handleSend(req, res);
+        }
+        if (req.method === "POST" && req.url.startsWith("/logout/")) {
+          return await handleLogout(req, res);
+        }
+        if (req.method === "GET" && req.url === "/status") {
+          return await handleStatus(req, res);
+        }
+        if (!isAuthorizedPage(req)) {
+          res.writeHead(401, { "WWW-Authenticate": 'Basic realm="WA API"' });
+          return res.end("Unauthorized");
         }
         await renderQrPage(res);
       } catch (err) {
         sendJson(res, 500, { error: err.message });
       }
     })
-    .listen(PORT, () => console.log(`🌐 WA API listening on :${PORT}`));
+    .listen(PORT, () => console.log(`WA API listening on :${PORT}`));
 }
 
-async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
+async function connectToWhatsApp(id) {
+  const acc = accounts.get(id);
+  const { state, saveCreds } = await useMultiFileAuthState(`auth/${id}`);
   const { version, isLatest } = await fetchLatestBaileysVersion();
-  console.log(`using WA v${version.join(".")}, isLatest: ${isLatest}`);
+  console.log(`[wa:${id}] using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false });
-  waSocket = sock;
+  acc.sock = sock;
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) currentQr = qr;
+    if (qr) acc.qr = qr;
 
     if (connection === "close") {
-      waReady = false;
-      console.log("[wa] closed:", String(lastDisconnect?.error || ""));
+      acc.ready = false;
+      console.log(`[wa:${id}] closed:`, String(lastDisconnect?.error || ""));
+      // Unlinked from the phone or via Logout: old creds are dead, wipe them so a fresh QR shows up
       if (
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+        lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut
       ) {
-        connectToWhatsApp();
+        fs.rmSync(`auth/${id}`, { recursive: true, force: true });
       }
+      connectToWhatsApp(id);
     }
     if (connection === "open") {
-      currentQr = "";
-      waReady = true;
-      console.log("✅ WA API Ready!");
+      acc.qr = "";
+      acc.ready = true;
+      console.log(`[wa:${id}] ready`);
     }
   });
 }
 
 startWebServer();
-connectToWhatsApp();
+ACCOUNTS.forEach(connectToWhatsApp);
