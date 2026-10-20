@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    container_name: wa-api
+    restart: always
+    ports:
+      - "8086:8086"
+    volumes:
+      - ./auth:/app/auth
+      - ./.env:/app/.env
