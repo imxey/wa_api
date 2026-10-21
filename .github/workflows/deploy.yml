@@ -1,0 +1,17 @@
+name: Deploy on release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Pull & rebuild
+        run: |
+          cd /home/app/wa_api
+          git fetch --tags origin
+          git checkout ${{ github.event.release.tag_name || 'origin/main' }}
+          docker compose up -d --build
