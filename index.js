@@ -35,6 +35,8 @@ const accounts = new Map(
 const QUEUE_SIZE = 1000;
 const PAGE_SIZE = 100;
 const queue = []; // oldest first
+// Ids of messages sent through POST /send, so the echo of our own send is not queued as a chat
+const apiSentIds = new Set();
 let lastCursor = 0;
 // Time-based so cursors keep increasing across restarts and the caller's saved cursor stays valid
 const nextCursor = () => (lastCursor = Math.max(lastCursor + 1, Date.now() * 1000));
@@ -188,7 +190,12 @@ async function handleSend(req, res) {
     return sendJson(res, 503, { error: "WhatsApp socket not ready" });
   }
 
-  await acc.sock.sendMessage(toJid(nomor), await buildContent(file, msg));
+  const sent = await acc.sock.sendMessage(toJid(nomor), await buildContent(file, msg));
+  // Sent via API: the caller already logs it, so keep it out of the chat queue (no duplicates)
+  if (sent?.key?.id) {
+    apiSentIds.add(sent.key.id);
+    if (apiSentIds.size > QUEUE_SIZE) apiSentIds.delete(apiSentIds.values().next().value);
+  }
   sendJson(res, 200, { success: true, message: "Pesan berhasil dikirim!" });
 }
 
@@ -396,15 +403,19 @@ async function connectToWhatsApp(id) {
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
       const isPrivate = isPnUser(key.remoteJid) || isLidUser(key.remoteJid);
       const pesan = textOf(msg);
-      if (key.fromMe || !isPrivate || !pesan) continue;
+      // fromMe = reply typed on the admin's own phone (kept); sends via POST /send are skipped
+      if (!isPrivate || !pesan || apiSentIds.has(key.id)) continue;
 
       queue.push({
         cursor: nextCursor(),
         akun: id,
+        // masuk = from the other person, keluar = reply from the admin's phone.
+        // nomor_pengirim/jid_pengirim are always the OTHER person (the chat partner).
+        arah: key.fromMe ? "keluar" : "masuk",
         id_pesan: key.id,
         nomor_pengirim: await senderNumber(sock, key),
         jid_pengirim: key.remoteJid,
-        nama_pengirim: msg.pushName || null,
+        nama_pengirim: key.fromMe ? null : msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
         pesan,
       });
