@@ -8,6 +8,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   normalizeMessageContent,
+  downloadMediaMessage,
   jidNormalizedUser,
   isPnUser,
   isLidUser,
@@ -45,9 +46,18 @@ const PAGE_SIZE = 100;
 const queue = []; // oldest first
 // Ids of messages sent through POST /send, so the echo of our own send is not queued as a chat
 const apiSentIds = new Set();
+// Photos/stickers: only the WA message (keys + CDN path) is kept, the file itself is fetched from
+// WhatsApp when GET /media asks for it, so no media is ever written to disk. cursor -> { akun, msg }
+const mediaMsgs = new Map();
 let lastCursor = 0;
 // Time-based so cursors keep increasing across restarts and the caller's saved cursor stays valid
 const nextCursor = () => (lastCursor = Math.max(lastCursor + 1, Date.now() * 1000));
+
+function pushQueue(item, msg) {
+  queue.push(item);
+  if (msg) mediaMsgs.set(item.cursor, { akun: item.akun, msg });
+  if (queue.length > QUEUE_SIZE) mediaMsgs.delete(queue.shift().cursor);
+}
 
 // DEBUG_INBOX=1: the newest few queued chats are also shown on the QR page
 const INBOX_PREVIEW = 20;
@@ -181,7 +191,8 @@ async function handleSend(req, res) {
     data.secretKey ||
     data.kodeRahasia;
   const file = data.file instanceof File ? data.file : null;
-  const acc = accounts.get(data.akun || data.account || ACCOUNTS[0]);
+  const akunId = data.akun || data.account || ACCOUNTS[0];
+  const acc = accounts.get(akunId);
 
   if (!isValidSecret(secret)) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
@@ -198,11 +209,29 @@ async function handleSend(req, res) {
     return sendJson(res, 503, { error: "WhatsApp socket not ready" });
   }
 
-  const sent = await acc.sock.sendMessage(toJid(nomor), await buildContent(file, msg));
-  // Sent via API: the caller already logs it, so keep it out of the chat queue (no duplicates)
+  const jid = toJid(nomor);
+  const sent = await acc.sock.sendMessage(jid, await buildContent(file, msg));
+  // The echo of an API send is never queued from messages.upsert (no duplicates)
   if (sent?.key?.id) {
     apiSentIds.add(sent.key.id);
     if (apiSentIds.size > QUEUE_SIZE) apiSentIds.delete(apiSentIds.values().next().value);
+  }
+  // Broadcast senders: the caller logs its own sends. Helpdesk: a reply typed in the calling app
+  // goes into the chat queue so it shows up in the conversation next to the replies from the phone.
+  if (sent?.key?.id && INBOX_ACCOUNTS.has(akunId)) {
+    pushQueue({
+      cursor: nextCursor(),
+      akun: akunId,
+      arah: "keluar",
+      sumber: "aplikasi",
+      jenis: file ? "dokumen" : "teks",
+      id_pesan: sent.key.id,
+      nomor_pengirim: jid.split("@")[0],
+      jid_pengirim: jid,
+      nama_pengirim: null,
+      waktu: new Date().toISOString(),
+      pesan: msg || "",
+    });
   }
   sendJson(res, 200, { success: true, message: "Pesan berhasil dikirim!" });
 }
@@ -320,6 +349,72 @@ async function handlePesanMasuk(req, res) {
   });
 }
 
+// GET /media?cursor=<cursor>: photo/sticker of one queued chat, downloaded from WhatsApp on the fly
+async function handleMedia(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const cursor = Number(new URL(req.url, "http://localhost").searchParams.get("cursor"));
+  const item = mediaMsgs.get(cursor);
+  const sock = item && accounts.get(item.akun)?.sock;
+  if (!item || !sock) {
+    return sendJson(res, 404, { error: "Media tidak ada di memori" });
+  }
+  const buffer = await downloadMediaMessage(item.msg, "buffer", {}, {
+    logger: sock.logger,
+    reuploadRequest: sock.updateMediaMessage,
+  });
+  const m = normalizeMessageContent(item.msg.message);
+  res.writeHead(200, {
+    "Content-Type": (m?.imageMessage || m?.stickerMessage)?.mimetype || "application/octet-stream",
+    "Cache-Control": "private, max-age=86400",
+  });
+  res.end(buffer);
+}
+
+// Profile photo URL per chat partner (null = hidden/none). Cached so a chat list refreshing every
+// few seconds does not ask WhatsApp again and again (repeated lookups look bot-like).
+const PHOTO_TTL_MS = 6 * 60 * 60 * 1000;
+const photoUrls = new Map(); // "akun|jid" -> { url, at }
+
+// GET /foto-profil?akun=<akun>&nomor=<nomor or jid>: small profile photo of someone who chatted the
+// helpdesk. Only partners present in the chat queue, so this can't be used to look up any number.
+async function handleFotoProfil(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const q = new URL(req.url, "http://localhost").searchParams;
+  const akun = q.get("akun");
+  const nomor = String(q.get("nomor") || "");
+  const sock = accounts.get(akun)?.ready && accounts.get(akun).sock;
+  const item = queue.find(
+    (p) => p.akun === akun && (p.nomor_pengirim === nomor.replace(/\D/g, "") || p.jid_pengirim === nomor),
+  );
+  if (!sock || !item || !nomor) {
+    return sendJson(res, 404, { error: "Tidak ada" });
+  }
+  const jid = item.jid_pengirim || toJid(nomor);
+  const key = `${akun}|${jid}`;
+  let cached = photoUrls.get(key);
+  if (!cached || Date.now() - cached.at > PHOTO_TTL_MS) {
+    // Throws when the photo is hidden by privacy settings or not set
+    const url = await sock.profilePictureUrl(jid, "preview").catch(() => null);
+    cached = { url: url || null, at: Date.now() };
+    photoUrls.set(key, cached);
+    if (photoUrls.size > QUEUE_SIZE) photoUrls.delete(photoUrls.keys().next().value);
+  }
+  const foto = cached.url && (await fetch(cached.url).catch(() => null));
+  if (!foto?.ok) {
+    if (cached.url) photoUrls.delete(key); // expired CDN link: ask WhatsApp again next time
+    return sendJson(res, 404, { error: "Tidak ada foto" });
+  }
+  res.writeHead(200, {
+    "Content-Type": foto.headers.get("content-type") || "image/jpeg",
+    "Cache-Control": "private, max-age=21600",
+  });
+  res.end(Buffer.from(await foto.arrayBuffer()));
+}
+
 // POST /logout/<akun>: X-Secret-Key from the calling app, or the Logout button on the QR page
 async function handleLogout(req, res) {
   const viaApi = isValidSecret(req.headers["x-secret-key"]);
@@ -373,6 +468,12 @@ function startWebServer() {
         if (req.method === "GET" && req.url.split("?")[0] === "/pesan-masuk") {
           return await handlePesanMasuk(req, res);
         }
+        if (req.method === "GET" && req.url.split("?")[0] === "/media") {
+          return await handleMedia(req, res);
+        }
+        if (req.method === "GET" && req.url.split("?")[0] === "/foto-profil") {
+          return await handleFotoProfil(req, res);
+        }
         if (!isAuthorizedPage(req)) {
           res.writeHead(401, { "WWW-Authenticate": 'Basic realm="WA API"' });
           return res.end("Unauthorized");
@@ -385,10 +486,23 @@ function startWebServer() {
     .listen(PORT, () => console.log(`WA API listening on :${PORT}`));
 }
 
-// Plain chat text only; media, reactions, stickers etc. return null and are skipped
-function textOf(msg) {
+const MEDIA_TYPES = {
+  imageMessage: "gambar",
+  stickerMessage: "stiker",
+  videoMessage: "video",
+  audioMessage: "audio",
+  documentMessage: "dokumen",
+};
+
+// Text or media (caption as text); reactions, edits, deletes etc. return null and are skipped
+function contentOf(msg) {
   const m = normalizeMessageContent(msg.message);
-  return m?.conversation || m?.extendedTextMessage?.text || null;
+  const text = m?.conversation || m?.extendedTextMessage?.text;
+  if (text) return { jenis: "teks", pesan: text };
+  const type = Object.keys(MEDIA_TYPES).find((t) => m?.[t]);
+  if (!type) return null;
+  const media = m[type];
+  return { jenis: MEDIA_TYPES[type], pesan: media.caption || media.fileName || "" };
 }
 
 // Private chats may arrive as a hidden @lid id; resolve it back to a phone number when WA allows
@@ -419,27 +533,33 @@ async function connectToWhatsApp(id) {
       const { key } = msg;
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
       const isPrivate = isPnUser(key.remoteJid) || isLidUser(key.remoteJid);
-      const pesan = textOf(msg);
+      const isi = contentOf(msg);
       // fromMe = reply typed on the admin's own phone (kept); sends via POST /send are skipped
-      if (!isPrivate || !pesan || apiSentIds.has(key.id)) continue;
+      if (!isPrivate || !isi || apiSentIds.has(key.id)) continue;
 
       // Await BEFORE taking a cursor: cursor + push must run with no await in between, or two
       // accounts can interleave, the queue gets out of cursor order and pulls skip/duplicate chats
       const nomorPengirim = await senderNumber(sock, key);
-      queue.push({
+      // WA sometimes delivers the same message twice (decrypt retry): queue it once
+      if (queue.some((p) => p.akun === id && p.id_pesan === key.id)) continue;
+      const preview = isi.jenis === "gambar" || isi.jenis === "stiker";
+      pushQueue({
         cursor: nextCursor(),
         akun: id,
         // masuk = from the other person, keluar = reply from the admin's phone.
         // nomor_pengirim/jid_pengirim are always the OTHER person (the chat partner).
         arah: key.fromMe ? "keluar" : "masuk",
+        sumber: "hp",
+        jenis: isi.jenis,
+        // true = GET /media?cursor= serves the picture
+        media: preview,
         id_pesan: key.id,
         nomor_pengirim: nomorPengirim,
         jid_pengirim: key.remoteJid,
         nama_pengirim: key.fromMe ? null : msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
-        pesan,
-      });
-      if (queue.length > QUEUE_SIZE) queue.shift();
+        pesan: isi.pesan,
+      }, preview ? msg : null);
     }
   });
 
