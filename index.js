@@ -7,6 +7,10 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  normalizeMessageContent,
+  jidNormalizedUser,
+  isPnUser,
+  isLidUser,
 } = require("baileys");
 const QRCode = require("qrcode");
 
@@ -24,6 +28,15 @@ for (const id of ACCOUNTS) {
 const accounts = new Map(
   ACCOUNTS.map((id) => [id, { sock: null, qr: "", ready: false }]),
 );
+
+// DEBUG_INBOX=1: last few incoming chats shown on the QR page, memory only (gone on restart)
+const INBOX_SIZE = 20;
+const inbox = [];
+const isDebugInbox = () => process.env.DEBUG_INBOX === "1";
+
+// Chat text and names come from strangers, never put them in HTML raw
+const escapeHtml = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 // Hash both sides so timingSafeEqual gets equal-length buffers
 function matches(value, expected) {
@@ -186,6 +199,25 @@ async function renderQrPage(res) {
     }),
   );
 
+  const rows = inbox
+    .map(
+      (p) => `<tr>
+        <td>${escapeHtml(new Date(p.waktu).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }))}</td>
+        <td>${escapeHtml(p.akun)}</td>
+        <td>${escapeHtml(p.nama_pengirim)}<br />${escapeHtml(p.nomor_pengirim || p.jid_pengirim)}</td>
+        <td>${escapeHtml(p.pesan)}</td>
+      </tr>`,
+    )
+    .join("");
+  const inboxHtml = isDebugInbox()
+    ? `<h2>Pesan masuk terakhir</h2>
+       <p class="note">Mode debug: hanya ${INBOX_SIZE} pesan terakhir, disimpan di memori, hilang saat restart.</p>
+       <div class="inbox"><table>
+         <tr><th>Waktu (WIB)</th><th>Akun</th><th>Pengirim</th><th>Pesan</th></tr>
+         ${rows || `<tr><td colspan="4">Belum ada pesan masuk</td></tr>`}
+       </table></div>`
+    : "";
+
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
@@ -206,11 +238,17 @@ async function renderQrPage(res) {
         padding: 12px; border-radius: 12px; box-sizing: border-box; }
       button { background: #dc2626; color: #fff; border: 0; padding: 8px 20px;
         border-radius: 8px; font: inherit; cursor: pointer; }
+      .note { color: #94a3b8; font-size: 14px; }
+      .inbox { max-width: 960px; margin: 0 auto 16px; padding: 0 16px; overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; text-align: left; background: #111827; }
+      th, td { padding: 8px 12px; border-bottom: 1px solid #1f2937; vertical-align: top;
+        overflow-wrap: anywhere; }
     </style>
   </head>
   <body>
     <h1>WhatsApp QR</h1>
     <div class="grid">${cards.join("")}</div>
+    ${inboxHtml}
     <p>Refresh otomatis tiap 5 detik.</p>
   </body>
 </html>`);
@@ -293,6 +331,55 @@ function startWebServer() {
     .listen(PORT, () => console.log(`WA API listening on :${PORT}`));
 }
 
+// Plain chat text only; media, reactions, stickers etc. return null and are skipped
+function textOf(msg) {
+  const m = normalizeMessageContent(msg.message);
+  return m?.conversation || m?.extendedTextMessage?.text || null;
+}
+
+// Private chats may arrive as a hidden @lid id; resolve it back to a phone number when WA allows
+async function senderNumber(sock, key) {
+  const jid = isPnUser(key.remoteJid)
+    ? key.remoteJid
+    : isPnUser(key.remoteJidAlt)
+      ? key.remoteJidAlt
+      : await sock.signalRepository.lidMapping.getPNForLID(key.remoteJid);
+  return jid ? jidNormalizedUser(jid).split("@")[0] : null;
+}
+
+// POST to revitsd, signed with HMAC-SHA256(SECRET_KEY, "<X-Timestamp>.<body>") so it can verify us.
+// Nothing is stored here; logs never include the message or the sender.
+// ponytail: 3 tries then dropped, add a persistent queue if revitsd downtime loses messages
+async function forwardIncoming(payload) {
+  const body = JSON.stringify(payload);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = crypto
+      .createHmac("sha256", process.env.SECRET_KEY)
+      .update(`${timestamp}.${body}`)
+      .digest("hex");
+    try {
+      const res = await fetch(process.env.WEBHOOK_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Timestamp": timestamp,
+          "X-Signature": signature,
+        },
+        body,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) return;
+      throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      if (attempt === 3) {
+        return console.log(`[webhook:${payload.akun}] gagal diteruskan (${err.message}), id_pesan ${payload.id_pesan}`);
+      }
+      await new Promise((r) => setTimeout(r, attempt * 5000));
+    }
+  }
+}
+
 async function connectToWhatsApp(id) {
   const acc = accounts.get(id);
   const { state, saveCreds } = await useMultiFileAuthState(`auth/${id}`);
@@ -303,6 +390,33 @@ async function connectToWhatsApp(id) {
   acc.sock = sock;
 
   sock.ev.on("creds.update", saveCreds);
+
+  // "notify" = new incoming messages; "append" is history sync after scanning the QR
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify" || (!process.env.WEBHOOK_URL && !isDebugInbox())) return;
+    for (const msg of messages) {
+      const { key } = msg;
+      // Private chats only: groups, status, broadcasts and channels are other JID kinds
+      const isPrivate = isPnUser(key.remoteJid) || isLidUser(key.remoteJid);
+      const pesan = textOf(msg);
+      if (key.fromMe || !isPrivate || !pesan) continue;
+
+      const payload = {
+        akun: id,
+        id_pesan: key.id,
+        nomor_pengirim: await senderNumber(sock, key),
+        jid_pengirim: key.remoteJid,
+        nama_pengirim: msg.pushName || null,
+        waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
+        pesan,
+      };
+      if (isDebugInbox()) {
+        inbox.unshift(payload);
+        inbox.length = Math.min(inbox.length, INBOX_SIZE);
+      }
+      if (process.env.WEBHOOK_URL) forwardIncoming(payload);
+    }
+  });
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
