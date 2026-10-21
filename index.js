@@ -29,9 +29,18 @@ const accounts = new Map(
   ACCOUNTS.map((id) => [id, { sock: null, qr: "", ready: false }]),
 );
 
-// DEBUG_INBOX=1: last few incoming chats shown on the QR page, memory only (gone on restart)
-const INBOX_SIZE = 20;
-const inbox = [];
+// Incoming chats wait here until the calling app pulls them via GET /pesan-masuk.
+// Memory only, so nothing personal touches the disk; unpulled chats are lost on restart.
+// ponytail: capped in-memory queue, persist it if restarts start losing chats
+const QUEUE_SIZE = 1000;
+const PAGE_SIZE = 100;
+const queue = []; // oldest first
+let lastCursor = 0;
+// Time-based so cursors keep increasing across restarts and the caller's saved cursor stays valid
+const nextCursor = () => (lastCursor = Math.max(lastCursor + 1, Date.now() * 1000));
+
+// DEBUG_INBOX=1: the newest few queued chats are also shown on the QR page
+const INBOX_PREVIEW = 20;
 const isDebugInbox = () => process.env.DEBUG_INBOX === "1";
 
 // Chat text and names come from strangers, never put them in HTML raw
@@ -199,7 +208,9 @@ async function renderQrPage(res) {
     }),
   );
 
-  const rows = inbox
+  const rows = queue
+    .slice(-INBOX_PREVIEW)
+    .reverse()
     .map(
       (p) => `<tr>
         <td>${escapeHtml(new Date(p.waktu).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }))}</td>
@@ -211,7 +222,7 @@ async function renderQrPage(res) {
     .join("");
   const inboxHtml = isDebugInbox()
     ? `<h2>Pesan masuk terakhir</h2>
-       <p class="note">Mode debug: hanya ${INBOX_SIZE} pesan terakhir, disimpan di memori, hilang saat restart.</p>
+       <p class="note">Mode debug: ${INBOX_PREVIEW} pesan terakhir dari antrian, disimpan di memori, hilang saat restart.</p>
        <div class="inbox"><table>
          <tr><th>Waktu (WIB)</th><th>Akun</th><th>Pengirim</th><th>Pesan</th></tr>
          ${rows || `<tr><td colspan="4">Belum ada pesan masuk</td></tr>`}
@@ -273,6 +284,22 @@ async function handleStatus(req, res) {
   sendJson(res, 200, { default: ACCOUNTS[0], akun });
 }
 
+// GET /pesan-masuk?sejak=<cursor>: queued chats after that cursor, oldest first, PAGE_SIZE per call.
+// The caller saves cursor_terakhir and sends it back next time; repeat while ada_lagi is true.
+async function handlePesanMasuk(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const sejak = Number(new URL(req.url, "http://localhost").searchParams.get("sejak")) || 0;
+  const baru = queue.filter((p) => p.cursor > sejak);
+  const pesan = baru.slice(0, PAGE_SIZE);
+  sendJson(res, 200, {
+    pesan,
+    cursor_terakhir: pesan.at(-1)?.cursor ?? sejak,
+    ada_lagi: baru.length > pesan.length,
+  });
+}
+
 // POST /logout/<akun>: X-Secret-Key from the calling app, or the Logout button on the QR page
 async function handleLogout(req, res) {
   const viaApi = isValidSecret(req.headers["x-secret-key"]);
@@ -306,7 +333,7 @@ function startWebServer() {
         res.writeHead(429, { "Retry-After": String(wait) });
         return res.end("Too Many Requests: terlalu banyak percobaan login, coba lagi nanti");
       }
-      // One hook covers every auth path (/send, /status, /logout, QR page)
+      // One hook covers every auth path (/send, /status, /pesan-masuk, /logout, QR page)
       res.on("finish", () => res.statusCode === 401 && recordFail(ip));
 
       try {
@@ -318,6 +345,9 @@ function startWebServer() {
         }
         if (req.method === "GET" && req.url === "/status") {
           return await handleStatus(req, res);
+        }
+        if (req.method === "GET" && req.url.split("?")[0] === "/pesan-masuk") {
+          return await handlePesanMasuk(req, res);
         }
         if (!isAuthorizedPage(req)) {
           res.writeHead(401, { "WWW-Authenticate": 'Basic realm="WA API"' });
@@ -347,39 +377,6 @@ async function senderNumber(sock, key) {
   return jid ? jidNormalizedUser(jid).split("@")[0] : null;
 }
 
-// POST to revitsd, signed with HMAC-SHA256(SECRET_KEY, "<X-Timestamp>.<body>") so it can verify us.
-// Nothing is stored here; logs never include the message or the sender.
-// ponytail: 3 tries then dropped, add a persistent queue if revitsd downtime loses messages
-async function forwardIncoming(payload) {
-  const body = JSON.stringify(payload);
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = crypto
-      .createHmac("sha256", process.env.SECRET_KEY)
-      .update(`${timestamp}.${body}`)
-      .digest("hex");
-    try {
-      const res = await fetch(process.env.WEBHOOK_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Timestamp": timestamp,
-          "X-Signature": signature,
-        },
-        body,
-        signal: AbortSignal.timeout(10000),
-      });
-      if (res.ok) return;
-      throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      if (attempt === 3) {
-        return console.log(`[webhook:${payload.akun}] gagal diteruskan (${err.message}), id_pesan ${payload.id_pesan}`);
-      }
-      await new Promise((r) => setTimeout(r, attempt * 5000));
-    }
-  }
-}
-
 async function connectToWhatsApp(id) {
   const acc = accounts.get(id);
   const { state, saveCreds } = await useMultiFileAuthState(`auth/${id}`);
@@ -393,7 +390,7 @@ async function connectToWhatsApp(id) {
 
   // "notify" = new incoming messages; "append" is history sync after scanning the QR
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify" || (!process.env.WEBHOOK_URL && !isDebugInbox())) return;
+    if (type !== "notify") return;
     for (const msg of messages) {
       const { key } = msg;
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
@@ -401,7 +398,8 @@ async function connectToWhatsApp(id) {
       const pesan = textOf(msg);
       if (key.fromMe || !isPrivate || !pesan) continue;
 
-      const payload = {
+      queue.push({
+        cursor: nextCursor(),
         akun: id,
         id_pesan: key.id,
         nomor_pengirim: await senderNumber(sock, key),
@@ -409,12 +407,8 @@ async function connectToWhatsApp(id) {
         nama_pengirim: msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
         pesan,
-      };
-      if (isDebugInbox()) {
-        inbox.unshift(payload);
-        inbox.length = Math.min(inbox.length, INBOX_SIZE);
-      }
-      if (process.env.WEBHOOK_URL) forwardIncoming(payload);
+      });
+      if (queue.length > QUEUE_SIZE) queue.shift();
     }
   });
 
