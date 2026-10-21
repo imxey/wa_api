@@ -17,10 +17,12 @@ const QRCode = require("qrcode");
 const PORT = process.env.PORT || 8086;
 
 // First account is the default for requests without `akun`
-const ACCOUNTS = (process.env.WA_ACCOUNTS || "utama")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const list = (s) =>
+  (s || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+const ACCOUNTS = list(process.env.WA_ACCOUNTS || "utama");
 // Names become folder names under auth/, so no path tricks allowed
 for (const id of ACCOUNTS) {
   if (!/^[a-z0-9_-]+$/i.test(id)) throw new Error(`Nama akun tidak valid: ${id}`);
@@ -28,6 +30,12 @@ for (const id of ACCOUNTS) {
 const accounts = new Map(
   ACCOUNTS.map((id) => [id, { sock: null, qr: "", ready: false }]),
 );
+
+// Only these accounts (e.g. the helpdesk number) get incoming chats queued; the rest are send-only
+const INBOX_ACCOUNTS = new Set(list(process.env.INBOX_ACCOUNTS));
+for (const id of INBOX_ACCOUNTS) {
+  if (!accounts.has(id)) console.log(`[inbox] PERINGATAN: "${id}" di INBOX_ACCOUNTS tidak ada di WA_ACCOUNTS`);
+}
 
 // Incoming chats wait here until the calling app pulls them via GET /pesan-masuk.
 // Memory only, so nothing personal touches the disk; unpulled chats are lost on restart.
@@ -283,6 +291,8 @@ async function handleStatus(req, res) {
       return {
         akun: id,
         ready,
+        // true = akun helpdesk (chat masuk ditarik); false = hanya pengirim broadcast
+        inbox: INBOX_ACCOUNTS.has(id),
         nomor: ready ? phoneOf(sock) : null,
         qr: !ready && qr ? await QRCode.toDataURL(qr, { margin: 1, scale: 6 }) : null,
       };
@@ -397,7 +407,7 @@ async function connectToWhatsApp(id) {
 
   // "notify" = new incoming messages; "append" is history sync after scanning the QR
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
+    if (type !== "notify" || !INBOX_ACCOUNTS.has(id)) return;
     for (const msg of messages) {
       const { key } = msg;
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
@@ -406,6 +416,9 @@ async function connectToWhatsApp(id) {
       // fromMe = reply typed on the admin's own phone (kept); sends via POST /send are skipped
       if (!isPrivate || !pesan || apiSentIds.has(key.id)) continue;
 
+      // Await BEFORE taking a cursor: cursor + push must run with no await in between, or two
+      // accounts can interleave, the queue gets out of cursor order and pulls skip/duplicate chats
+      const nomorPengirim = await senderNumber(sock, key);
       queue.push({
         cursor: nextCursor(),
         akun: id,
@@ -413,7 +426,7 @@ async function connectToWhatsApp(id) {
         // nomor_pengirim/jid_pengirim are always the OTHER person (the chat partner).
         arah: key.fromMe ? "keluar" : "masuk",
         id_pesan: key.id,
-        nomor_pengirim: await senderNumber(sock, key),
+        nomor_pengirim: nomorPengirim,
         jid_pengirim: key.remoteJid,
         nama_pengirim: key.fromMe ? null : msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
