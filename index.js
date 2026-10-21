@@ -207,6 +207,9 @@ async function handleSend(req, res) {
   sendJson(res, 200, { success: true, message: "Pesan berhasil dikirim!" });
 }
 
+async function status(res) {
+  sendJson(res, 200, { success: true, message: "API is running!" });}
+
 async function renderQrPage(res) {
   const cards = await Promise.all(
     ACCOUNTS.map(async (id) => {
@@ -354,6 +357,10 @@ function startWebServer() {
       res.on("finish", () => res.statusCode === 401 && recordFail(ip));
 
       try {
+        if (req.method === "GET" && req.url === "/health") {
+          return await status(res);
+        }
+
         if (req.method === "POST" && req.url === "/send") {
           return await handleSend(req, res);
         }
