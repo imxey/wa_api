@@ -1,10 +1,47 @@
 services:
   app:
     build: .
-    container_name: wa-api
+    container_name: wasap-scheduler
     restart: always
-    ports:
-      - "8086:8086"
+    depends_on:
+      - mysql
+    environment:
+      - NODE_ENV=development
+      - DB_HOST=mysql
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
     volumes:
       - ./auth:/app/auth
       - ./.env:/app/.env
+    networks:
+      - wanetwork
+
+  mysql:
+    image: mysql:8.0
+    container_name: wasap-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${DB_NAME}
+      - MYSQL_USER=${DB_USER}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+    networks:
+      - wanetwork
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    command: tunnel --no-autoupdate --url http://app:8086 run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    networks:
+      - wanetwork
+
+networks:
+  wanetwork:
+
+volumes:
+  wasap-data:
