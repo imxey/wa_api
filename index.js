@@ -479,6 +479,11 @@ function startWebServer() {
         if (req.method === "GET" && req.url.split("?")[0] === "/foto-profil") {
           return await handleFotoProfil(req, res);
         }
+        // QR page is for direct access only (localhost/SSH tunnel). Apache always adds
+        // X-Forwarded-For, so anything proxied gets a plain 404 instead of a login prompt
+        if (req.headers["x-forwarded-for"]) {
+          return sendJson(res, 404, { error: "Not Found" });
+        }
         if (!isAuthorizedPage(req)) {
           res.writeHead(401, { "WWW-Authenticate": 'Basic realm="WA API"' });
           return res.end("Unauthorized");
