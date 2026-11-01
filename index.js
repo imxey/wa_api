@@ -16,6 +16,8 @@ const {
 const QRCode = require("qrcode");
 
 const PORT = process.env.PORT || 8086;
+// Loopback by default so only the local reverse proxy (and SSH tunnel) can reach it
+const HOST = process.env.HOST || "127.0.0.1";
 
 // First account is the default for requests without `akun`
 const list = (s) =>
@@ -105,10 +107,13 @@ const WINDOW_MS = 15 * 60 * 1000;
 const failures = new Map(); // ip -> { count, since, until }
 
 function clientIp(req) {
-  // Behind a reverse proxy every request comes from the proxy's IP, so trust the
-  // entry it appends (the last one); earlier entries are client-controlled
-  if (process.env.TRUST_PROXY === "1" && req.headers["x-forwarded-for"]) {
-    return req.headers["x-forwarded-for"].split(",").pop().trim();
+  // TRUST_PROXY = number of trusted proxies in front of the app. Each proxy appends one entry
+  // to the end of X-Forwarded-For, so the Nth from the end is the real client; entries
+  // before that are client-controlled and can be forged
+  const hops = Number(process.env.TRUST_PROXY) || 0;
+  if (hops > 0 && req.headers["x-forwarded-for"]) {
+    const ips = req.headers["x-forwarded-for"].split(",").map((s) => s.trim()).filter(Boolean);
+    if (ips.length >= hops) return ips[ips.length - hops];
   }
   return req.socket.remoteAddress;
 }
@@ -483,7 +488,7 @@ function startWebServer() {
         sendJson(res, 500, { error: err.message });
       }
     })
-    .listen(PORT, () => console.log(`WA API listening on :${PORT}`));
+    .listen(PORT, HOST, () => console.log(`WA API listening on ${HOST}:${PORT}`));
 }
 
 const MEDIA_TYPES = {

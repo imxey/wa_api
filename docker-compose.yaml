@@ -7,6 +7,7 @@ services:
       - mysql
     environment:
       - NODE_ENV=development
+      - HOST=0.0.0.0
       - DB_HOST=mysql
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
