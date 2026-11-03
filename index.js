@@ -19,26 +19,47 @@ const PORT = process.env.PORT || 8086;
 // Loopback by default so only the local reverse proxy (and SSH tunnel) can reach it
 const HOST = process.env.HOST || "127.0.0.1";
 
-// First account is the default for requests without `akun`
 const list = (s) =>
   (s || "")
     .split(",")
     .map((t) => t.trim())
     .filter(Boolean);
-const ACCOUNTS = list(process.env.WA_ACCOUNTS || "utama");
-// Names become folder names under auth/, so no path tricks allowed
-for (const id of ACCOUNTS) {
-  if (!/^[a-z0-9_-]+$/i.test(id)) throw new Error(`Nama akun tidak valid: ${id}`);
-}
-const accounts = new Map(
-  ACCOUNTS.map((id) => [id, { sock: null, qr: "", ready: false }]),
-);
 
-// Only these accounts (e.g. the helpdesk number) get incoming chats queued; the rest are send-only
-const INBOX_ACCOUNTS = new Set(list(process.env.INBOX_ACCOUNTS));
-for (const id of INBOX_ACCOUNTS) {
-  if (!accounts.has(id)) console.log(`[inbox] PERINGATAN: "${id}" di INBOX_ACCOUNTS tidak ada di WA_ACCOUNTS`);
+// Account list + inbox flags, managed via /akun. Lives next to the sessions so the same volume keeps it.
+// inbox=true: incoming chats are queued for GET /pesan-masuk. Every account can send via /send.
+const STORE = "auth/akun.json";
+// Names become folder names under auth/, so no path tricks allowed (no dot = can't clash with akun.json)
+const NEW_NAME = /^[a-z0-9-]{1,32}$/;
+const OLD_NAME = /^[a-z0-9_-]+$/i; // names migrated from env may still use these
+
+function loadStore() {
+  try {
+    return JSON.parse(fs.readFileSync(STORE, "utf8"));
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err; // corrupt file: stop rather than silently re-migrate
+  }
+  // First run: migrate the accounts from env. After this the env vars are ignored.
+  const inbox = new Set(list(process.env.INBOX_ACCOUNTS));
+  const now = new Date().toISOString();
+  return list(process.env.WA_ACCOUNTS || "utama").map((akun) => ({ akun, inbox: inbox.has(akun), dibuat_at: now }));
 }
+
+// Insertion order = order in /status; the first account is the default for requests without `akun`
+const accounts = new Map();
+for (const { akun, inbox, dibuat_at } of loadStore()) {
+  if (!OLD_NAME.test(akun)) throw new Error(`Nama akun tidak valid: ${akun}`);
+  accounts.set(akun, { sock: null, qr: "", ready: false, inbox: !!inbox, dibuat_at });
+}
+const defaultAkun = () => accounts.keys().next().value ?? null;
+
+// Write-then-rename so a crash mid-write never leaves a half-written file
+function saveStore() {
+  const rows = [...accounts].map(([akun, a]) => ({ akun, inbox: a.inbox, dibuat_at: a.dibuat_at }));
+  fs.mkdirSync("auth", { recursive: true });
+  fs.writeFileSync(`${STORE}.tmp`, JSON.stringify(rows, null, 2));
+  fs.renameSync(`${STORE}.tmp`, STORE);
+}
+saveStore();
 
 // Incoming chats wait here until the calling app pulls them via GET /pesan-masuk.
 // Memory only, so nothing personal touches the disk; unpulled chats are lost on restart.
@@ -48,18 +69,54 @@ const PAGE_SIZE = 100;
 const queue = []; // oldest first
 // Ids of messages sent through POST /send, so the echo of our own send is not queued as a chat
 const apiSentIds = new Set();
-// Photos/stickers: only the WA message (keys + CDN path) is kept, the file itself is fetched from
-// WhatsApp when GET /media asks for it, so no media is ever written to disk. cursor -> { akun, msg }
-const mediaMsgs = new Map();
+// The WA message of every queued chat, needed to reply to (quote) or forward it. For media only the
+// keys + CDN path are kept, the file itself is fetched from WhatsApp when GET /media asks for it,
+// so no media is ever written to disk. cursor -> { akun, msg }
+const waMsgs = new Map();
 let lastCursor = 0;
 // Time-based so cursors keep increasing across restarts and the caller's saved cursor stays valid
 const nextCursor = () => (lastCursor = Math.max(lastCursor + 1, Date.now() * 1000));
 
 function pushQueue(item, msg) {
   queue.push(item);
-  if (msg) mediaMsgs.set(item.cursor, { akun: item.akun, msg });
-  if (queue.length > QUEUE_SIZE) mediaMsgs.delete(queue.shift().cursor);
+  if (msg) waMsgs.set(item.cursor, { akun: item.akun, msg });
+  if (queue.length > QUEUE_SIZE) waMsgs.delete(queue.shift().cursor);
 }
+
+const findMsg = (akun, id) => {
+  const item = queue.find((p) => p.akun === akun && p.id_pesan === id);
+  return item && waMsgs.get(item.cursor)?.msg;
+};
+
+// Quote text when the message being replied to is no longer in memory (restart, older than the queue)
+const KUTIPAN_HILANG = "Pesan tidak dapat dimuat karena sudah tidak tersimpan di server";
+
+// Receipts of messages we sent (API, broadcast and phone), pulled via GET /status-pesan.
+// A 200 from /send already means one tick; the feed carries what comes after.
+// ponytail: memory only like the chat queue; receipts not pulled before a restart are lost
+const STATUS_SIZE = 5000; // bigger than the queue: one broadcast alone yields thousands
+const STATUS_NAMES = { 0: "gagal", 2: "terkirim", 3: "diterima", 4: "dibaca", 5: "diputar" };
+const statusFeed = []; // oldest first
+const lastStatus = new Map(); // "akun|id" -> highest status seen
+
+function recordStatus(akun, updates) {
+  for (const { key, update } of updates) {
+    const name = STATUS_NAMES[update.status];
+    // fromMe = receipt for OUR message; the rest is e.g. the admin reading a chat on another device
+    if (!key.fromMe || !name || !(isPnUser(key.remoteJid) || isLidUser(key.remoteJid))) continue;
+    const k = `${akun}|${key.id}`;
+    // WA repeats receipts and can deliver "read" before "delivered": only forward progress (or an error)
+    if (update.status !== 0 && (lastStatus.get(k) ?? -1) >= update.status) continue;
+    lastStatus.delete(k); // re-insert as newest so the cap below drops the oldest
+    lastStatus.set(k, update.status);
+    if (lastStatus.size > STATUS_SIZE) lastStatus.delete(lastStatus.keys().next().value);
+    statusFeed.push({ cursor: nextCursor(), akun, id_pesan: key.id, status: name, waktu: new Date().toISOString() });
+    if (statusFeed.length > STATUS_SIZE) statusFeed.shift();
+  }
+}
+
+// Incoming messages already marked read via POST /baca, so reopening a chat doesn't resend receipts
+const readIds = new Set();
 
 // DEBUG_INBOX=1: the newest few queued chats are also shown on the QR page
 const INBOX_PREVIEW = 20;
@@ -152,12 +209,13 @@ function toJid(nomor) {
 }
 
 // Pick the WA message type from the file's mimetype; anything else goes as a document
-async function buildContent(file, caption) {
+async function buildContent(file, caption, stiker) {
   if (!file) return { text: caption };
 
   const buffer = Buffer.from(await file.arrayBuffer());
   const mimetype = file.type || "application/octet-stream";
 
+  if (stiker) return { sticker: buffer };
   if (mimetype.startsWith("image/")) return { image: buffer, caption };
   if (mimetype.startsWith("video/")) return { video: buffer, caption };
   if (mimetype.startsWith("audio/")) return { audio: buffer, mimetype };
@@ -196,8 +254,11 @@ async function handleSend(req, res) {
     data.secretKey ||
     data.kodeRahasia;
   const file = data.file instanceof File ? data.file : null;
-  const akunId = data.akun || data.account || ACCOUNTS[0];
+  const akunId = data.akun || data.account || defaultAkun();
   const acc = accounts.get(akunId);
+  // Multipart sends booleans as strings
+  const stiker = [true, "true", "1"].includes(data.stiker);
+  const balasId = data.balas_id_pesan ? String(data.balas_id_pesan) : null;
 
   if (!isValidSecret(secret)) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
@@ -210,35 +271,84 @@ async function handleSend(req, res) {
       error: "Bad Request: nomor and message or file are required",
     });
   }
+  // WhatsApp only shows webp as a sticker; anything else arrives broken
+  if (stiker && file?.type !== "image/webp") {
+    return sendJson(res, 400, { error: "Bad Request: stiker wajib file image/webp" });
+  }
   if (!acc.sock || !acc.ready) {
     return sendJson(res, 503, { error: "WhatsApp socket not ready" });
   }
 
   const jid = toJid(nomor);
-  const sent = await acc.sock.sendMessage(jid, await buildContent(file, msg));
+  const found = balasId && findMsg(akunId, balasId);
+  // Not in memory any more: still quote it (same id, so tapping it jumps to the original on the
+  // recipient's phone), with a placeholder text since the original content is gone
+  const quoted =
+    balasId && (found || { key: { remoteJid: jid, fromMe: false, id: balasId }, message: { conversation: KUTIPAN_HILANG } });
+  const sent = await acc.sock.sendMessage(jid, await buildContent(file, msg, stiker), quoted ? { quoted } : {});
+  queueSent(akunId, jid, sent);
+  sendJson(res, 200, {
+    success: true,
+    message: "Pesan berhasil dikirim!",
+    id_pesan: sent?.key?.id ?? null,
+    ...(balasId && { kutipan_dimuat: !!found }),
+  });
+}
+
+// POST /teruskan {"akun", "id_pesan", "nomor_tujuan"}: forward a queued message (still in memory).
+// Media is forwarded by reference, nothing is downloaded or re-uploaded.
+async function handleTeruskan(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const data = await readBody(req);
+  const akunId = data.akun || defaultAkun();
+  const nomor = data.nomor_tujuan || data.nomor;
+  const acc = accounts.get(akunId);
+  if (!acc) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
+  }
+  if (!nomor || !data.id_pesan) {
+    return sendJson(res, 400, { error: "Bad Request: id_pesan dan nomor_tujuan wajib" });
+  }
+  const msg = findMsg(akunId, String(data.id_pesan));
+  if (!msg) {
+    return sendJson(res, 404, { error: "Pesan tidak ada di memori" });
+  }
+  if (!acc.sock || !acc.ready) {
+    return sendJson(res, 503, { error: "WhatsApp socket not ready" });
+  }
+  const jid = toJid(nomor);
+  const sent = await acc.sock.sendMessage(jid, { forward: msg });
+  queueSent(akunId, jid, sent);
+  sendJson(res, 200, { success: true, id_pesan: sent?.key?.id ?? null });
+}
+
+function queueSent(akunId, jid, sent) {
+  if (!sent?.key?.id) return;
   // The echo of an API send is never queued from messages.upsert (no duplicates)
-  if (sent?.key?.id) {
-    apiSentIds.add(sent.key.id);
-    if (apiSentIds.size > QUEUE_SIZE) apiSentIds.delete(apiSentIds.values().next().value);
-  }
-  // Broadcast senders: the caller logs its own sends. Helpdesk: a reply typed in the calling app
-  // goes into the chat queue so it shows up in the conversation next to the replies from the phone.
-  if (sent?.key?.id && INBOX_ACCOUNTS.has(akunId)) {
-    pushQueue({
-      cursor: nextCursor(),
-      akun: akunId,
-      arah: "keluar",
-      sumber: "aplikasi",
-      jenis: file ? "dokumen" : "teks",
-      id_pesan: sent.key.id,
-      nomor_pengirim: jid.split("@")[0],
-      jid_pengirim: jid,
-      nama_pengirim: null,
-      waktu: new Date().toISOString(),
-      pesan: msg || "",
-    });
-  }
-  sendJson(res, 200, { success: true, message: "Pesan berhasil dikirim!" });
+  apiSentIds.add(sent.key.id);
+  if (apiSentIds.size > QUEUE_SIZE) apiSentIds.delete(apiSentIds.values().next().value);
+  // A message sent from the calling app goes into the chat queue so it shows up in the conversation
+  // next to the replies from the phone. Only for numbers that already chatted this account: broadcasts
+  // and first messages to new numbers would otherwise flood the chat list (the caller logs those itself).
+  const nomor = jid.split("@")[0];
+  const hasChat = queue.some((p) => p.akun === akunId && (p.nomor_pengirim === nomor || p.jid_pengirim === jid));
+  const isi = contentOf(sent.message);
+  if (!accounts.get(akunId)?.inbox || !hasChat || !isi) return;
+  pushQueue({
+    cursor: nextCursor(),
+    akun: akunId,
+    arah: "keluar",
+    sumber: "aplikasi",
+    media: isi.jenis !== "teks",
+    id_pesan: sent.key.id,
+    nomor_pengirim: nomor,
+    jid_pengirim: jid,
+    nama_pengirim: null,
+    waktu: new Date().toISOString(),
+    ...isi,
+  }, sent);
 }
 
 async function status(res) {
@@ -246,8 +356,7 @@ async function status(res) {
 
 async function renderQrPage(res) {
   const cards = await Promise.all(
-    ACCOUNTS.map(async (id) => {
-      const { qr, ready, sock } = accounts.get(id);
+    [...accounts].map(async ([id, { qr, ready, sock }]) => {
       const body = ready
         ? `<p>Tersambung: ${phoneOf(sock)}</p>
            <form method="post" action="/logout/${id}" onsubmit="return confirm('Logout ${id} dari WhatsApp?')">
@@ -323,58 +432,172 @@ async function handleStatus(req, res) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
   }
   const akun = await Promise.all(
-    ACCOUNTS.map(async (id) => {
-      const { qr, ready, sock } = accounts.get(id);
-      return {
-        akun: id,
-        ready,
-        // true = akun helpdesk (chat masuk ditarik); false = hanya pengirim broadcast
-        inbox: INBOX_ACCOUNTS.has(id),
-        nomor: ready ? phoneOf(sock) : null,
-        qr: !ready && qr ? await QRCode.toDataURL(qr, { margin: 1, scale: 6 }) : null,
-      };
-    }),
+    [...accounts].map(async ([id, { qr, ready, sock, inbox, dibuat_at }]) => ({
+      akun: id,
+      ready,
+      // true = chat masuk ditarik ke GET /pesan-masuk; false = chat masuk hanya di HP
+      inbox,
+      nomor: ready ? phoneOf(sock) : null,
+      qr: !ready && qr ? await QRCode.toDataURL(qr, { margin: 1, scale: 6 }) : null,
+      dibuat_at,
+    })),
   );
-  sendJson(res, 200, { default: ACCOUNTS[0], akun });
+  sendJson(res, 200, { default: defaultAkun(), akun });
 }
 
-// GET /pesan-masuk?sejak=<cursor>: queued chats after that cursor, oldest first, PAGE_SIZE per call.
-// The caller saves cursor_terakhir and sends it back next time; repeat while ada_lagi is true.
+const akunJson = (id) => ({ akun: id, inbox: accounts.get(id).inbox, dibuat_at: accounts.get(id).dibuat_at });
+
+// POST /akun {"akun": "<nama>"}: new, not yet logged-in session; its QR shows up in GET /status
+async function handleBuatAkun(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const { akun } = await readBody(req);
+  if (typeof akun !== "string" || !NEW_NAME.test(akun)) {
+    return sendJson(res, 400, { error: "Bad Request: akun wajib 1-32 karakter huruf kecil/angka/strip" });
+  }
+  if (accounts.has(akun)) {
+    return sendJson(res, 409, { error: "Akun sudah ada" });
+  }
+  // Leftover creds of an old account with this name would otherwise log in silently
+  fs.rmSync(`auth/${akun}`, { recursive: true, force: true });
+  accounts.set(akun, { sock: null, qr: "", ready: false, inbox: false, dibuat_at: new Date().toISOString() });
+  saveStore();
+  connect(akun);
+  sendJson(res, 201, { success: true, ...akunJson(akun) });
+}
+
+// DELETE /akun/<akun>: unlink from WhatsApp and wipe the session. A /send already in flight on this
+// account fails with a plain error (its socket is closed), later ones get "akun tidak dikenal".
+async function handleHapusAkun(req, res, id) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const acc = accounts.get(id);
+  if (!acc) {
+    return sendJson(res, 404, { error: "Akun tidak ada" });
+  }
+  // Out of the map first: the close handler and a still-running connect see this and stop reconnecting
+  accounts.delete(id);
+  saveStore();
+  const { sock } = acc;
+  sock?.ev.removeAllListeners("creds.update"); // no more writes into the folder deleted below
+  if (acc.ready) await sock.logout().catch(() => {}); // unlinks the device on the phone too
+  else sock?.end(undefined);
+  acc.ready = false;
+  fs.rmSync(`auth/${id}`, { recursive: true, force: true });
+  sendJson(res, 200, { success: true });
+}
+
+// POST /akun/<akun>/inbox {"inbox": true|false}: whether incoming chats are queued for GET /pesan-masuk
+async function handleInbox(req, res, id) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const acc = accounts.get(id);
+  if (!acc) {
+    return sendJson(res, 404, { error: "Akun tidak ada" });
+  }
+  const { inbox } = await readBody(req);
+  if (typeof inbox !== "boolean") {
+    return sendJson(res, 400, { error: "Bad Request: inbox harus true atau false" });
+  }
+  acc.inbox = inbox;
+  saveStore();
+  sendJson(res, 200, { success: true, ...akunJson(id) });
+}
+
+// Items after ?sejak=<cursor>, oldest first, PAGE_SIZE per call. The caller saves cursor_terakhir
+// and sends it back next time; repeat while ada_lagi is true.
+function pageAfter(req, list) {
+  const sejak = Number(new URL(req.url, "http://localhost").searchParams.get("sejak")) || 0;
+  const baru = list.filter((p) => p.cursor > sejak);
+  const items = baru.slice(0, PAGE_SIZE);
+  return [items, { cursor_terakhir: items.at(-1)?.cursor ?? sejak, ada_lagi: baru.length > items.length }];
+}
+
+// GET /pesan-masuk?sejak=<cursor>: queued chats
 async function handlePesanMasuk(req, res) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
   }
-  const sejak = Number(new URL(req.url, "http://localhost").searchParams.get("sejak")) || 0;
-  const baru = queue.filter((p) => p.cursor > sejak);
-  const pesan = baru.slice(0, PAGE_SIZE);
-  sendJson(res, 200, {
-    pesan,
-    cursor_terakhir: pesan.at(-1)?.cursor ?? sejak,
-    ada_lagi: baru.length > pesan.length,
-  });
+  const [pesan, info] = pageAfter(req, queue);
+  sendJson(res, 200, { pesan, ...info });
 }
 
-// GET /media?cursor=<cursor>: photo/sticker of one queued chat, downloaded from WhatsApp on the fly
+// GET /status-pesan?sejak=<cursor>: tick changes of sent messages (diterima, dibaca, diputar, gagal)
+async function handleStatusPesan(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const [status, info] = pageAfter(req, statusFeed);
+  sendJson(res, 200, { status, ...info });
+}
+
+// POST /baca {"akun", "nomor"}: mark that chat's queued incoming messages as read (blue ticks for the
+// sender), e.g. when the admin opens the chat in the calling app
+async function handleBaca(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const data = await readBody(req);
+  const akunId = data.akun || defaultAkun();
+  const acc = accounts.get(akunId);
+  if (!acc) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
+  }
+  if (!data.nomor) {
+    return sendJson(res, 400, { error: "Bad Request: nomor wajib" });
+  }
+  if (!acc.sock || !acc.ready) {
+    return sendJson(res, 503, { error: "WhatsApp socket not ready" });
+  }
+  const jid = toJid(data.nomor);
+  const nomor = jid.split("@")[0];
+  const keys = queue
+    .filter(
+      (p) =>
+        p.akun === akunId &&
+        p.arah === "masuk" &&
+        !readIds.has(`${akunId}|${p.id_pesan}`) &&
+        (p.nomor_pengirim === nomor || p.jid_pengirim === jid || p.jid_pengirim === data.nomor),
+    )
+    .map((p) => waMsgs.get(p.cursor)?.msg.key)
+    .filter(Boolean);
+  // Sends "read-self" instead when this account has read receipts turned off: then no blue ticks
+  if (keys.length) await acc.sock.readMessages(keys);
+  for (const k of keys) readIds.add(`${akunId}|${k.id}`);
+  while (readIds.size > QUEUE_SIZE) readIds.delete(readIds.values().next().value);
+  sendJson(res, 200, { success: true, dibaca: keys.length });
+}
+
+// GET /media?cursor=<cursor>: file of one queued chat (photo, sticker, video, voice note, document...),
+// downloaded from WhatsApp on the fly
 async function handleMedia(req, res) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
   }
   const cursor = Number(new URL(req.url, "http://localhost").searchParams.get("cursor"));
-  const item = mediaMsgs.get(cursor);
+  const item = waMsgs.get(cursor);
   const sock = item && accounts.get(item.akun)?.sock;
-  if (!item || !sock) {
+  const m = item && normalizeMessageContent(item.msg.message);
+  const media = m?.[Object.keys(MEDIA_TYPES).find((t) => m[t])];
+  if (!sock || !media) {
     return sendJson(res, 404, { error: "Media tidak ada di memori" });
   }
-  const buffer = await downloadMediaMessage(item.msg, "buffer", {}, {
+  // Streamed: videos and documents can be far too big to hold in memory
+  const stream = await downloadMediaMessage(item.msg, "stream", {}, {
     logger: sock.logger,
     reuploadRequest: sock.updateMediaMessage,
   });
-  const m = normalizeMessageContent(item.msg.message);
-  res.writeHead(200, {
-    "Content-Type": (m?.imageMessage || m?.stickerMessage)?.mimetype || "application/octet-stream",
+  const headers = {
+    "Content-Type": media.mimetype || "application/octet-stream",
     "Cache-Control": "private, max-age=86400",
-  });
-  res.end(buffer);
+  };
+  // The name comes from the sender: percent-encoded so it can't break out of the header
+  if (media.fileName) headers["Content-Disposition"] = `inline; filename*=UTF-8''${encodeURIComponent(media.fileName)}`;
+  res.writeHead(200, headers);
+  stream.on("error", () => res.destroy()).pipe(res);
 }
 
 // Profile photo URL per chat partner (null = hidden/none). Cached so a chat list refreshing every
@@ -479,6 +702,25 @@ function startWebServer() {
         if (req.method === "GET" && req.url.split("?")[0] === "/foto-profil") {
           return await handleFotoProfil(req, res);
         }
+        if (req.method === "GET" && req.url.split("?")[0] === "/status-pesan") {
+          return await handleStatusPesan(req, res);
+        }
+        if (req.method === "POST" && req.url === "/baca") {
+          return await handleBaca(req, res);
+        }
+        if (req.method === "POST" && req.url === "/teruskan") {
+          return await handleTeruskan(req, res);
+        }
+        if (req.method === "POST" && req.url === "/akun") {
+          return await handleBuatAkun(req, res);
+        }
+        const akunPath = req.url.split("?")[0].match(/^\/akun\/([^/]+)(\/inbox)?$/);
+        if (akunPath && req.method === "DELETE" && !akunPath[2]) {
+          return await handleHapusAkun(req, res, decodeURIComponent(akunPath[1]));
+        }
+        if (akunPath && req.method === "POST" && akunPath[2]) {
+          return await handleInbox(req, res, decodeURIComponent(akunPath[1]));
+        }
         // QR page is for direct access only (localhost/SSH tunnel). Apache always adds
         // X-Forwarded-For, so anything proxied gets a plain 404 instead of a login prompt
         if (req.headers["x-forwarded-for"]) {
@@ -500,19 +742,28 @@ const MEDIA_TYPES = {
   imageMessage: "gambar",
   stickerMessage: "stiker",
   videoMessage: "video",
-  audioMessage: "audio",
+  ptvMessage: "video_bulat", // round video note
+  audioMessage: "audio", // "pesan_suara" when it's a voice note (ptt)
   documentMessage: "dokumen",
 };
 
-// Text or media (caption as text); reactions, edits, deletes etc. return null and are skipped
-function contentOf(msg) {
-  const m = normalizeMessageContent(msg.message);
+// Text or media (caption as text) plus reply/forward info; reactions, edits, deletes etc. return null
+function contentOf(message) {
+  const m = normalizeMessageContent(message);
   const text = m?.conversation || m?.extendedTextMessage?.text;
-  if (text) return { jenis: "teks", pesan: text };
-  const type = Object.keys(MEDIA_TYPES).find((t) => m?.[t]);
-  if (!type) return null;
-  const media = m[type];
-  return { jenis: MEDIA_TYPES[type], pesan: media.caption || media.fileName || "" };
+  const type = !text && Object.keys(MEDIA_TYPES).find((t) => m?.[t]);
+  if (!text && !type) return null;
+  const media = type && m[type];
+  const ctx = (media || m.extendedTextMessage)?.contextInfo;
+  const quoted = ctx?.quotedMessage && contentOf(ctx.quotedMessage);
+  return {
+    jenis: text ? "teks" : type === "audioMessage" && media.ptt ? "pesan_suara" : MEDIA_TYPES[type],
+    pesan: text || media.caption || media.fileName || "",
+    // id_pesan of the message this one replies to, plus a short preview of it
+    balasan_untuk: ctx?.stanzaId || null,
+    kutipan: quoted ? quoted.pesan || `[${quoted.jenis}]` : null,
+    diteruskan: !!ctx?.isForwarded,
+  };
 }
 
 // Private chats may arrive as a hidden @lid id; resolve it back to a phone number when WA allows
@@ -525,25 +776,39 @@ async function senderNumber(sock, key) {
   return jid ? jidNormalizedUser(jid).split("@")[0] : null;
 }
 
+// A failed connect (disk full, bad auth folder) must not kill the gateway: retry this account later
+function connect(id) {
+  const acc = accounts.get(id);
+  connectToWhatsApp(id).catch((err) => {
+    console.error(`[wa:${id}] gagal connect, coba lagi 10 detik:`, err);
+    // Not if it was deleted (or deleted and re-created) meanwhile: that would open a second socket
+    setTimeout(() => accounts.get(id) === acc && connect(id), 10_000);
+  });
+}
+
 async function connectToWhatsApp(id) {
   const acc = accounts.get(id);
+  if (!acc) return; // deleted before this (re)connect started
   const { state, saveCreds } = await useMultiFileAuthState(`auth/${id}`);
   const { version, isLatest } = await fetchLatestBaileysVersion();
+  // Deleted (or deleted and re-created) while we were awaiting: leave it to the new one
+  if (accounts.get(id) !== acc) return;
   console.log(`[wa:${id}] using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false });
   acc.sock = sock;
 
   sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("messages.update", (updates) => recordStatus(id, updates));
 
   // "notify" = new incoming messages; "append" is history sync after scanning the QR
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify" || !INBOX_ACCOUNTS.has(id)) return;
+    if (type !== "notify" || !acc.inbox) return;
     for (const msg of messages) {
       const { key } = msg;
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
       const isPrivate = isPnUser(key.remoteJid) || isLidUser(key.remoteJid);
-      const isi = contentOf(msg);
+      const isi = contentOf(msg.message);
       // fromMe = reply typed on the admin's own phone (kept); sends via POST /send are skipped
       if (!isPrivate || !isi || apiSentIds.has(key.id)) continue;
 
@@ -552,7 +817,6 @@ async function connectToWhatsApp(id) {
       const nomorPengirim = await senderNumber(sock, key);
       // WA sometimes delivers the same message twice (decrypt retry): queue it once
       if (queue.some((p) => p.akun === id && p.id_pesan === key.id)) continue;
-      const preview = isi.jenis === "gambar" || isi.jenis === "stiker";
       pushQueue({
         cursor: nextCursor(),
         akun: id,
@@ -560,16 +824,15 @@ async function connectToWhatsApp(id) {
         // nomor_pengirim/jid_pengirim are always the OTHER person (the chat partner).
         arah: key.fromMe ? "keluar" : "masuk",
         sumber: "hp",
-        jenis: isi.jenis,
-        // true = GET /media?cursor= serves the picture
-        media: preview,
+        // true = GET /media?cursor= serves the file
+        media: isi.jenis !== "teks",
         id_pesan: key.id,
         nomor_pengirim: nomorPengirim,
         jid_pengirim: key.remoteJid,
         nama_pengirim: key.fromMe ? null : msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
-        pesan: isi.pesan,
-      }, preview ? msg : null);
+        ...isi, // jenis, pesan, balasan_untuk, kutipan, diteruskan
+      }, msg);
     }
   });
 
@@ -581,13 +844,14 @@ async function connectToWhatsApp(id) {
     if (connection === "close") {
       acc.ready = false;
       console.log(`[wa:${id}] closed:`, String(lastDisconnect?.error || ""));
+      if (accounts.get(id) !== acc) return; // deleted via DELETE /akun: no reconnect
       // Unlinked from the phone or via Logout: old creds are dead, wipe them so a fresh QR shows up
       if (
         lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut
       ) {
         fs.rmSync(`auth/${id}`, { recursive: true, force: true });
       }
-      connectToWhatsApp(id);
+      connect(id);
     }
     if (connection === "open") {
       acc.qr = "";
@@ -598,4 +862,4 @@ async function connectToWhatsApp(id) {
 }
 
 startWebServer();
-ACCOUNTS.forEach(connectToWhatsApp);
+for (const id of accounts.keys()) connect(id);
