@@ -12,8 +12,15 @@ const {
   jidNormalizedUser,
   isPnUser,
   isLidUser,
+  decryptPollVote,
 } = require("baileys");
 const QRCode = require("qrcode");
+
+// node index.js --self-check: test the poll vote decoding, before anything below touches disk or WhatsApp
+if (process.argv[2] === "--self-check") {
+  selfCheck();
+  process.exit(0);
+}
 
 const PORT = process.env.PORT || 8086;
 // Loopback by default so only the local reverse proxy (and SSH tunnel) can reach it
@@ -32,12 +39,26 @@ const STORE = "auth/akun.json";
 const NEW_NAME = /^[a-z0-9-]{1,32}$/;
 const OLD_NAME = /^[a-z0-9_-]+$/i; // names migrated from env may still use these
 
-function loadStore() {
+// null when the file doesn't exist yet; a corrupt file throws (stop rather than silently start over)
+function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(STORE, "utf8"));
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
-    if (err.code !== "ENOENT") throw err; // corrupt file: stop rather than silently re-migrate
+    if (err.code !== "ENOENT") throw err;
+    return null;
   }
+}
+
+// Write-then-rename so a crash mid-write never leaves a half-written file
+function writeJson(file, data) {
+  fs.mkdirSync("auth", { recursive: true });
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+function loadStore() {
+  const stored = readJson(STORE);
+  if (stored) return stored;
   // First run: migrate the accounts from env. After this the env vars are ignored.
   const inbox = new Set(list(process.env.INBOX_ACCOUNTS));
   const now = new Date().toISOString();
@@ -52,19 +73,30 @@ for (const { akun, inbox, dibuat_at } of loadStore()) {
 }
 const defaultAkun = () => accounts.keys().next().value ?? null;
 
-// Write-then-rename so a crash mid-write never leaves a half-written file
 function saveStore() {
-  const rows = [...accounts].map(([akun, a]) => ({ akun, inbox: a.inbox, dibuat_at: a.dibuat_at }));
-  fs.mkdirSync("auth", { recursive: true });
-  fs.writeFileSync(`${STORE}.tmp`, JSON.stringify(rows, null, 2));
-  fs.renameSync(`${STORE}.tmp`, STORE);
+  writeJson(STORE, [...accounts].map(([akun, a]) => ({ akun, inbox: a.inbox, dibuat_at: a.dibuat_at })));
 }
 saveStore();
+
+// Polls sent via POST /polling. Votes arrive encrypted with the poll's secret, so the secret (and the
+// option texts the vote hashes point to) must outlive a restart. No phone numbers are stored here.
+const POLL_STORE = "auth/polling.json";
+const POLL_STORE_SIZE = 500;
+const polls = new Map(); // "akun|id" -> { akun, id, secret, pilihan, dibuat_at }
+for (const p of readJson(POLL_STORE) || []) polls.set(`${p.akun}|${p.id}`, p);
+
+function savePoll(p) {
+  polls.set(`${p.akun}|${p.id}`, p);
+  if (polls.size > POLL_STORE_SIZE) polls.delete(polls.keys().next().value);
+  writeJson(POLL_STORE, [...polls.values()]);
+}
 
 // Incoming chats wait here until the calling app pulls them via GET /pesan-masuk.
 // Memory only, so nothing personal touches the disk; unpulled chats are lost on restart.
 // ponytail: capped in-memory queue, persist it if restarts start losing chats
-const QUEUE_SIZE = 1000;
+// Shared by all accounts. Also how long a chat can still be quoted, forwarded or have its media fetched.
+// Only message metadata is kept (no files), so 5000 stays in the tens of MB at most.
+const QUEUE_SIZE = 5000;
 const PAGE_SIZE = 100;
 const queue = []; // oldest first
 // Ids of messages sent through POST /send, so the echo of our own send is not queued as a chat
@@ -77,10 +109,17 @@ let lastCursor = 0;
 // Time-based so cursors keep increasing across restarts and the caller's saved cursor stays valid
 const nextCursor = () => (lastCursor = Math.max(lastCursor + 1, Date.now() * 1000));
 
+// Long-poll requests (?tunggu=) that found nothing new wait here; any push to a feed wakes them
+const waiters = new Set();
+function wake() {
+  for (const done of waiters) done();
+}
+
 function pushQueue(item, msg) {
   queue.push(item);
   if (msg) waMsgs.set(item.cursor, { akun: item.akun, msg });
   if (queue.length > QUEUE_SIZE) waMsgs.delete(queue.shift().cursor);
+  wake();
 }
 
 const findMsg = (akun, id) => {
@@ -112,7 +151,89 @@ function recordStatus(akun, updates) {
     if (lastStatus.size > STATUS_SIZE) lastStatus.delete(lastStatus.keys().next().value);
     statusFeed.push({ cursor: nextCursor(), akun, id_pesan: key.id, status: name, waktu: new Date().toISOString() });
     if (statusFeed.length > STATUS_SIZE) statusFeed.shift();
+    wake();
   }
+}
+
+// Decrypted votes on polls from POST /polling, pulled via GET /hasil-polling.
+// ponytail: memory only like the status feed; votes not pulled before a restart are lost
+const VOTE_SIZE = 5000;
+const voteFeed = []; // oldest first
+
+// A vote is encrypted with the poll's own secret and names the chosen options by their SHA-256.
+// The voter's app signs it with either the phone-number or the @lid id of each side, so every pair
+// is tried; a wrong pair fails the GCM check. Returns the chosen option texts ([] = vote withdrawn),
+// or null when no pair opens it.
+function decodeVote(poll, vote, creatorJids, voterJids) {
+  const pollEncKey = Buffer.from(poll.secret, "base64");
+  const norm = (jids) => [...new Set(jids.filter(Boolean).map(jidNormalizedUser))];
+  for (const pollCreatorJid of norm(creatorJids)) {
+    for (const voterJid of norm(voterJids)) {
+      let selected;
+      try {
+        selected = decryptPollVote(vote, { pollCreatorJid, pollMsgId: poll.id, pollEncKey, voterJid }).selectedOptions;
+      } catch {
+        continue;
+      }
+      const hashes = new Set(selected.map((h) => Buffer.from(h).toString("hex")));
+      return poll.pilihan.filter((p) => hashes.has(crypto.createHash("sha256").update(p).digest("hex")));
+    }
+  }
+  return null;
+}
+
+function selfCheck() {
+  const assert = require("assert");
+  const { aesEncryptGCM, hmacSign, proto } = require("baileys");
+  // Same steps as decryptPollVote, in reverse
+  function encryptVote(poll, creator, voter, options) {
+    const secret = Buffer.from(poll.secret, "base64");
+    const sign = Buffer.concat([Buffer.from(poll.id), Buffer.from(creator), Buffer.from(voter), Buffer.from("Poll Vote"), Buffer.from([1])]);
+    const key = hmacSign(sign, hmacSign(secret, new Uint8Array(32)));
+    const encIv = crypto.randomBytes(12);
+    const plain = proto.Message.PollVoteMessage.encode({
+      selectedOptions: options.map((o) => crypto.createHash("sha256").update(o).digest()),
+    }).finish();
+    return { encIv, encPayload: aesEncryptGCM(plain, key, encIv, Buffer.from(`${poll.id}\u0000${voter}`)) };
+  }
+
+  const poll = { id: "3EB0POLL", secret: crypto.randomBytes(32).toString("base64"), pilihan: ["Senin", "Rabu", "Jumat"] };
+  const me = ["628111:5@s.whatsapp.net", "999:5@lid"];
+  const voter = ["123@lid", "628222@s.whatsapp.net"];
+
+  // Signed with the @lid of the creator and the phone number of the voter: found by trying pairs
+  const vote = encryptVote(poll, "999@lid", "628222@s.whatsapp.net", ["Rabu", "Jumat"]);
+  assert.deepStrictEqual(decodeVote(poll, vote, me, voter), ["Rabu", "Jumat"]);
+  assert.deepStrictEqual(decodeVote(poll, encryptVote(poll, "628111@s.whatsapp.net", "123@lid", []), me, voter), []);
+  // Unknown option hash is dropped, not reported as a choice
+  assert.deepStrictEqual(decodeVote(poll, encryptVote(poll, "999@lid", "123@lid", ["Sabtu"]), me, voter), []);
+  // Wrong secret: unreadable
+  assert.strictEqual(decodeVote({ ...poll, secret: crypto.randomBytes(32).toString("base64") }, vote, me, voter), null);
+  console.log("self-check OK");
+}
+
+// Only polls sent via POST /polling can be read: their secret is in polls. A vote from the admin's own
+// phone is skipped (the app records its own choices).
+async function recordVote(akun, sock, msg, update) {
+  const poll = polls.get(`${akun}|${update.pollCreationMessageKey?.id}`);
+  if (!poll || msg.key.fromMe) return;
+  const { key } = msg;
+  const pilihan = decodeVote(poll, update.vote, [sock.user?.id, sock.user?.lid], [key.remoteJid, key.remoteJidAlt]);
+  if (!pilihan) return console.log(`[wa:${akun}] vote polling ${poll.id} tidak bisa dibuka`);
+  // Await BEFORE taking a cursor, same as the chat queue
+  const nomor = await senderNumber(sock, key);
+  voteFeed.push({
+    cursor: nextCursor(),
+    akun,
+    id_polling: poll.id,
+    nomor_pemilih: nomor,
+    jid_pemilih: key.remoteJid,
+    // The voter's full current choice; [] = vote withdrawn
+    pilihan,
+    waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
+  });
+  if (voteFeed.length > VOTE_SIZE) voteFeed.shift();
+  wake();
 }
 
 // Incoming messages already marked read via POST /baca, so reopening a chat doesn't resend receipts
@@ -324,6 +445,56 @@ async function handleTeruskan(req, res) {
   sendJson(res, 200, { success: true, id_pesan: sent?.key?.id ?? null });
 }
 
+// WhatsApp's own limit on poll options
+const MAX_POLL_OPTIONS = 12;
+
+// POST /polling {"akun", "nomor", "pertanyaan", "pilihan": [...], "maks_pilihan"}: send a poll to a
+// private chat. Votes come back via GET /hasil-polling.
+async function handlePolling(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const data = await readBody(req);
+  const akunId = data.akun || defaultAkun();
+  const acc = accounts.get(akunId);
+  const nomor = data.nomor_tujuan || data.nomor;
+  const { pertanyaan, pilihan } = data;
+  // 1 = choose one, 0 = choose any number
+  const maks = data.maks_pilihan ?? 1;
+  if (!acc) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
+  }
+  if (!nomor || typeof pertanyaan !== "string" || !pertanyaan.trim()) {
+    return sendJson(res, 400, { error: "Bad Request: nomor dan pertanyaan wajib" });
+  }
+  // Votes point to options by the hash of their text, so duplicates would be indistinguishable
+  if (
+    !Array.isArray(pilihan) ||
+    pilihan.length < 2 ||
+    pilihan.length > MAX_POLL_OPTIONS ||
+    pilihan.some((p) => typeof p !== "string" || !p.trim()) ||
+    new Set(pilihan).size !== pilihan.length
+  ) {
+    return sendJson(res, 400, { error: `Bad Request: pilihan wajib array 2-${MAX_POLL_OPTIONS} teks unik (kirim sebagai JSON)` });
+  }
+  if (!Number.isInteger(maks) || maks < 0 || maks > pilihan.length) {
+    return sendJson(res, 400, { error: "Bad Request: maks_pilihan wajib angka 0 sampai jumlah pilihan" });
+  }
+  const jid = toJid(nomor);
+  // Votes are only read from private chats (see messages.upsert)
+  if (!isPnUser(jid) && !isLidUser(jid)) {
+    return sendJson(res, 400, { error: "Bad Request: polling hanya untuk chat pribadi" });
+  }
+  if (!acc.sock || !acc.ready) {
+    return sendJson(res, 503, { error: "WhatsApp socket not ready" });
+  }
+  const sent = await acc.sock.sendMessage(jid, { poll: { name: pertanyaan, values: pilihan, selectableCount: maks } });
+  const secret = sent.message.messageContextInfo.messageSecret;
+  savePoll({ akun: akunId, id: sent.key.id, secret: Buffer.from(secret).toString("base64"), pilihan, dibuat_at: new Date().toISOString() });
+  queueSent(akunId, jid, sent);
+  sendJson(res, 200, { success: true, id_pesan: sent.key.id });
+}
+
 function queueSent(akunId, jid, sent) {
   if (!sent?.key?.id) return;
   // The echo of an API send is never queued from messages.upsert (no duplicates)
@@ -341,7 +512,6 @@ function queueSent(akunId, jid, sent) {
     akun: akunId,
     arah: "keluar",
     sumber: "aplikasi",
-    media: isi.jenis !== "teks",
     id_pesan: sent.key.id,
     nomor_pengirim: nomor,
     jid_pengirim: jid,
@@ -507,10 +677,37 @@ async function handleInbox(req, res, id) {
   sendJson(res, 200, { success: true, ...akunJson(id) });
 }
 
+// Kept under Apache's default 60s proxy timeout, or a waiting request ends as a 502
+const MAX_WAIT_S = 30;
+
+// Resolves on the next push to any feed, after ms, or when the caller hangs up
+function waitForPush(res, ms) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      waiters.delete(done);
+      res.off("close", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    waiters.add(done);
+    res.on("close", done);
+  });
+}
+
 // Items after ?sejak=<cursor>, oldest first, PAGE_SIZE per call. The caller saves cursor_terakhir
 // and sends it back next time; repeat while ada_lagi is true.
-function pageAfter(req, list) {
-  const sejak = Number(new URL(req.url, "http://localhost").searchParams.get("sejak")) || 0;
+// ?tunggu=<detik> (long-poll): when nothing is new yet, hold the request until something arrives
+// in this list or the time is up (then an empty page), so the caller gets new items right away.
+async function pageAfter(req, res, list) {
+  const q = new URL(req.url, "http://localhost").searchParams;
+  const sejak = Number(q.get("sejak")) || 0;
+  const deadline = Date.now() + Math.min(Number(q.get("tunggu")) || 0, MAX_WAIT_S) * 1000;
+  // Lists are in cursor order, so the last item tells whether anything is new. A push to another feed
+  // also wakes us: just check again.
+  while (!(list.at(-1)?.cursor > sejak) && Date.now() < deadline && !res.destroyed) {
+    await waitForPush(res, deadline - Date.now());
+  }
   const baru = list.filter((p) => p.cursor > sejak);
   const items = baru.slice(0, PAGE_SIZE);
   return [items, { cursor_terakhir: items.at(-1)?.cursor ?? sejak, ada_lagi: baru.length > items.length }];
@@ -521,8 +718,17 @@ async function handlePesanMasuk(req, res) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
   }
-  const [pesan, info] = pageAfter(req, queue);
+  const [pesan, info] = await pageAfter(req, res, queue);
   sendJson(res, 200, { pesan, ...info });
+}
+
+// GET /hasil-polling?sejak=<cursor>: votes on polls sent via POST /polling
+async function handleHasilPolling(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const [hasil, info] = await pageAfter(req, res, voteFeed);
+  sendJson(res, 200, { hasil, ...info });
 }
 
 // GET /status-pesan?sejak=<cursor>: tick changes of sent messages (diterima, dibaca, diputar, gagal)
@@ -530,7 +736,7 @@ async function handleStatusPesan(req, res) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
     return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
   }
-  const [status, info] = pageAfter(req, statusFeed);
+  const [status, info] = await pageAfter(req, res, statusFeed);
   sendJson(res, 200, { status, ...info });
 }
 
@@ -711,6 +917,12 @@ function startWebServer() {
         if (req.method === "POST" && req.url === "/teruskan") {
           return await handleTeruskan(req, res);
         }
+        if (req.method === "POST" && req.url === "/polling") {
+          return await handlePolling(req, res);
+        }
+        if (req.method === "GET" && req.url.split("?")[0] === "/hasil-polling") {
+          return await handleHasilPolling(req, res);
+        }
         if (req.method === "POST" && req.url === "/akun") {
           return await handleBuatAkun(req, res);
         }
@@ -747,9 +959,25 @@ const MEDIA_TYPES = {
   documentMessage: "dokumen",
 };
 
-// Text or media (caption as text) plus reply/forward info; reactions, edits, deletes etc. return null
+// V3 = single choice, V2 = community announcement groups
+const POLL_TYPES = ["pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"];
+
+// Text, media (caption as text) or poll, plus reply/forward info; reactions, votes, edits, deletes etc.
+// return null
 function contentOf(message) {
   const m = normalizeMessageContent(message);
+  const poll = POLL_TYPES.map((t) => m?.[t]).find(Boolean);
+  if (poll) {
+    return {
+      jenis: "polling",
+      media: false,
+      pesan: poll.name || "",
+      pilihan: (poll.options || []).map((o) => o.optionName),
+      balasan_untuk: null,
+      kutipan: null,
+      diteruskan: false,
+    };
+  }
   const text = m?.conversation || m?.extendedTextMessage?.text;
   const type = !text && Object.keys(MEDIA_TYPES).find((t) => m?.[t]);
   if (!text && !type) return null;
@@ -758,6 +986,8 @@ function contentOf(message) {
   const quoted = ctx?.quotedMessage && contentOf(ctx.quotedMessage);
   return {
     jenis: text ? "teks" : type === "audioMessage" && media.ptt ? "pesan_suara" : MEDIA_TYPES[type],
+    // true = GET /media?cursor= serves the file
+    media: !text,
     pesan: text || media.caption || media.fileName || "",
     // id_pesan of the message this one replies to, plus a short preview of it
     balasan_untuk: ctx?.stanzaId || null,
@@ -803,11 +1033,18 @@ async function connectToWhatsApp(id) {
 
   // "notify" = new incoming messages; "append" is history sync after scanning the QR
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify" || !acc.inbox) return;
+    if (type !== "notify") return;
     for (const msg of messages) {
       const { key } = msg;
       // Private chats only: groups, status, broadcasts and channels are other JID kinds
       const isPrivate = isPnUser(key.remoteJid) || isLidUser(key.remoteJid);
+      // Poll votes count for every account, not only inbox ones
+      const vote = isPrivate && normalizeMessageContent(msg.message)?.pollUpdateMessage;
+      if (vote) {
+        await recordVote(id, sock, msg, vote);
+        continue;
+      }
+      if (!acc.inbox) continue;
       const isi = contentOf(msg.message);
       // fromMe = reply typed on the admin's own phone (kept); sends via POST /send are skipped
       if (!isPrivate || !isi || apiSentIds.has(key.id)) continue;
@@ -824,14 +1061,12 @@ async function connectToWhatsApp(id) {
         // nomor_pengirim/jid_pengirim are always the OTHER person (the chat partner).
         arah: key.fromMe ? "keluar" : "masuk",
         sumber: "hp",
-        // true = GET /media?cursor= serves the file
-        media: isi.jenis !== "teks",
         id_pesan: key.id,
         nomor_pengirim: nomorPengirim,
         jid_pengirim: key.remoteJid,
         nama_pengirim: key.fromMe ? null : msg.pushName || null,
         waktu: new Date(Number(msg.messageTimestamp) * 1000).toISOString(),
-        ...isi, // jenis, pesan, balasan_untuk, kutipan, diteruskan
+        ...isi, // jenis, media, pesan, (pilihan), balasan_untuk, kutipan, diteruskan
       }, msg);
     }
   });

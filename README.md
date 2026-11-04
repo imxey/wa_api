@@ -66,7 +66,8 @@ curl -X POST http://127.0.0.1:8086/akun/admin9/inbox \
 
 Item `GET /pesan-masuk` punya field tambahan:
 
-- `jenis`: `teks`, `gambar`, `stiker`, `video`, `video_bulat` (video note), `audio`, `pesan_suara` (voice note), `dokumen`
+- `jenis`: `teks`, `gambar`, `stiker`, `video`, `video_bulat` (video note), `audio`, `pesan_suara` (voice note), `dokumen`, `polling`
+  (`pesan` = pertanyaannya, field tambahan `pilihan` = daftar pilihannya)
 - `media`: `true` = file-nya bisa diambil lewat `GET /media?cursor=<cursor>`
 - `balasan_untuk`: `id_pesan` yang dibalas (reply), `kutipan`: potongan teksnya (`[gambar]` dsb. kalau tanpa teks)
 - `diteruskan`: `true` kalau pesan ini hasil forward
@@ -78,7 +79,7 @@ curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/media?cursor=17300000
 ```
 
 Reply: `POST /send` dengan `balas_id_pesan`. Respon berisi `id_pesan` pesan yang terkirim dan `kutipan_dimuat`.
-Kalau pesan yang dibalas sudah tidak ada di memori gateway (restart / lebih lama dari 1000 item terakhir),
+Kalau pesan yang dibalas sudah tidak ada di memori gateway (restart / lebih lama dari 5000 item terakhir semua akun),
 tetap dikirim sebagai reply dengan kutipan "Pesan tidak dapat dimuat..." dan `kutipan_dimuat: false`.
 
 ```sh
@@ -104,6 +105,55 @@ curl -X POST http://127.0.0.1:8086/teruskan \
   -d '{"akun": "helpdesk", "id_pesan": "3EB0ABC123", "nomor_tujuan": "08129876543"}'
 # {"success":true,"id_pesan":"3EB0GHI789"}
 ```
+
+## Long-polling (`tunggu`)
+
+`GET /pesan-masuk`, `GET /status-pesan` dan `GET /hasil-polling` menerima `tunggu=<detik>` (maks 30).
+Kalau belum ada item baru setelah `sejak`, request ditahan sampai ada item baru (langsung dijawab) atau
+waktunya habis (dijawab daftar kosong). Format respon sama. Tanpa `tunggu` perilakunya seperti biasa.
+
+Dipakai oleh satu worker yang jalan terus di aplikasi pemanggil (1 proses per feed), bukan dari tiap
+browser: request yang ditahan memakai 1 koneksi selama menunggu. Timeout HTTP di pemanggil harus lebih
+lama dari `tunggu` (misalnya `tunggu=25`, timeout 35 detik). Batas 30 detik menjaga request tetap di bawah
+timeout proxy Apache (default 60 detik).
+
+```sh
+curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/pesan-masuk?sejak=1730000000000001&tunggu=25"
+```
+
+## Polling (vote)
+
+Kirim polling ke chat pribadi (grup ditolak `400`), bisa dari semua akun. Body wajib JSON.
+`pilihan`: 2-12 teks unik. `maks_pilihan`: `1` = pilih satu (default), `0` = boleh pilih banyak,
+atau angka batasnya. Simpan `id_pesan` sebagai id polling.
+
+```sh
+curl -X POST http://127.0.0.1:8086/polling \
+  -H "X-Secret-Key: $SECRET_KEY" -H "Content-Type: application/json" \
+  -d '{"akun": "helpdesk", "nomor": "08123456789", "pertanyaan": "Jadwal pelatihan?", "pilihan": ["Senin", "Rabu", "Jumat"]}'
+# {"success":true,"id_pesan":"3EB0POLL123"}
+```
+
+Vote ditarik lewat `GET /hasil-polling`, pola cursor sama seperti `/status-pesan`. Tiap item berisi
+**pilihan lengkap terbaru** pemilih itu: ganti pilihan = item baru, `pilihan: []` = vote dibatalkan.
+Di aplikasi cukup upsert per `(id_polling, pemilih)`, yang menang item dengan `cursor` terbesar.
+`nomor_pemilih` bisa `null` kalau nomornya tersembunyi (`@lid`); pakai `jid_pemilih` sebagai identitas.
+
+```sh
+curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/hasil-polling?sejak=0"
+# {"hasil":[{"cursor":1730000000000005,"akun":"helpdesk","id_polling":"3EB0POLL123",
+#   "nomor_pemilih":"628123456789","jid_pemilih":"628123456789@s.whatsapp.net","pilihan":["Rabu"],
+#   "waktu":"2026-11-04T03:10:00.000Z"}],"cursor_terakhir":1730000000000005,"ada_lagi":false}
+```
+
+Batasan:
+
+- Hanya vote untuk polling yang dikirim lewat `POST /polling`. Polling dari HP atau dari pelanggan tetap
+  tampil di percakapan (`jenis: "polling"`), tapi vote-nya tidak bisa dibaca. Vote dari HP admin sendiri dilewati.
+- Kunci 500 polling terakhir disimpan di `auth/polling.json` (tanpa nomor), jadi vote tetap bisa dibaca
+  setelah restart. Polling yang lebih lama: vote-nya diabaikan.
+- Feed vote di memori (5000 terakhir): vote yang belum ditarik saat gateway restart hilang.
+- Kirim polling ke banyak nomor yang belum pernah chat = broadcast, risiko blokir sama.
 
 ## Status pesan (centang)
 
