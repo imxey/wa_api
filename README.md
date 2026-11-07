@@ -23,6 +23,129 @@ git pull && npm install && npx pm2 restart wa-api
 User server dipakai bersama: selalu sebut nama `wa-api`, jangan pakai `all`
 (misalnya `pm2 restart all` / `pm2 stop all`) karena ikut mengenai proses orang lain.
 
+Cek sebelum restart (tanpa koneksi WhatsApp). Dengan `SELFCHECK_DB_NAME` terisi, skenario antrean broadcast
+ikut diuji ke database tes itu:
+
+```sh
+node index.js --self-check   # "self-check OK" + "broadcast self-check OK"
+```
+
+## Broadcast
+
+Gateway menerima satu broadcast utuh lalu mengirimnya sendiri per akun, pelan-pelan, tahan restart
+(antrean di MySQL). Semua endpoint wajib header `X-Secret-Key`, membalas JSON, error `4xx` berisi `{error}`.
+`503` = database belum siap / belum diatur (endpoint lain tetap jalan).
+
+### Aturan kirim
+
+- Hanya pada jam `[jam_mulai, jam_selesai)` WIB; di luar itu menunggu jam mulai berikutnya.
+- `batas_harian` per akun (terkirim hari ini di akun itu, semua broadcast); tercapai = akun itu lanjut besok.
+- Jeda acak `jeda_min..jeda_maks` detik dari pesan terakhir akun itu (lintas broadcast, termasuk yang gagal).
+- Istirahat acak 300-600 detik setiap `istirahat_setiap` pesan terkirim akun itu hari ini.
+- Akun berbeda paralel, satu akun satu pesan dalam satu waktu. Urutan: broadcast tertua, lalu urutan penerima.
+- Akun belum tersambung saat gilirannya, lebih dari 120 detik berturut-turut: broadcast itu `jeda`
+  (catatan `Akun <akun> belum tersambung`). Putus sebentar / baru restart tidak menjeda.
+- `gagal_beruntun` kegagalan berturut-turut dalam satu broadcast: broadcast `jeda` dengan catatan.
+- Penerima dengan akun yang tidak ada di gateway: `gagal` `akun tidak ada`.
+- Lampiran: gambar dikirim sebagai foto, selain itu dokumen; `pesan` jadi keterangannya.
+  File disimpan di `auth/lampiran/<id>/`, dihapus 7 hari setelah broadcast selesai/dibatalkan.
+- Restart di tengah kirim: penerima yang belum sempat dikirim kembali ke antrean. Yang sudah diserahkan ke
+  WhatsApp jadi `gagal` "Proses berhenti saat mengirim, mungkin sudah terkirim" dengan `id_pesan`-nya, dan
+  tidak dikirim ulang (juga tidak oleh `/lanjut`) supaya tidak dobel. Cocokkan `id_pesan` dengan `/status-pesan`.
+
+### Buat broadcast
+
+Multipart: field `data` (JSON) + opsional file `lampiran`. Tanpa lampiran boleh body JSON biasa.
+Maks 5000 penerima, `id_eksternal` 1-64 karakter, `id_eksternal` penerima unik dalam satu broadcast,
+`pesan` sudah jadi (tanpa variabel), boleh kosong hanya kalau ada lampiran.
+Idempoten: `id_eksternal` yang sama dikirim ulang membalas broadcast yang sudah ada (`200`, bukan `201`).
+
+```sh
+curl -X POST http://127.0.0.1:8086/broadcast -H "X-Secret-Key: $SECRET_KEY" \
+  -F 'data={"id_eksternal":"45","penerima":[
+        {"id_eksternal":"901","akun":"admin1","nomor":"08123456789","pesan":"Yth. Bapak Budi, ..."},
+        {"id_eksternal":"902","akun":"admin2","nomor":"08129876543","pesan":"Yth. Ibu Sari, ..."}]}' \
+  -F "lampiran=@undangan.pdf;type=application/pdf"
+# {"id":12,"id_eksternal":"45","total":2}
+```
+
+### Kendalikan broadcast
+
+`<id>` boleh `id_eksternal` atau id gateway; `id_eksternal` dicocokkan lebih dulu (pakai `id_eksternal`).
+
+```sh
+curl -X POST -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/broadcast/45/jeda
+curl -X POST -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/broadcast/45/lanjut   # yang gagal masuk antrean lagi
+curl -X POST -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/broadcast/45/batal    # sisa antrean jadi dibatalkan
+curl -X POST -H "X-Secret-Key: $SECRET_KEY" -H "Content-Type: application/json" \
+  -d '{"penerima": ["901"]}' http://127.0.0.1:8086/broadcast/45/lewati                # atau {"akun": "admin1"}
+# {"id":12,"id_eksternal":"45","status":"jeda","catatan":"Dijeda lewat API"}
+```
+
+- `lewati`: penerima `menunggu`/`gagal` jadi `dilewati`; broadcast yang tidak punya sisa jadi `selesai`.
+- `lanjut` juga untuk broadcast `selesai` yang masih punya penerima gagal. `409` kalau lampirannya sudah dihapus.
+- `409` untuk aksi pada broadcast `dibatalkan`, dan `jeda`/`batal` pada broadcast `selesai`.
+
+Status broadcast: `berjalan`, `jeda`, `selesai`, `dibatalkan`.
+Status penerima: `menunggu`, `mengirim`, `terkirim`, `gagal`, `dilewati`, `dibatalkan`.
+
+```sh
+curl -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/broadcast/45
+# {"broadcast":{"id":12,"id_eksternal":"45","status":"berjalan","catatan":null,"lampiran_nama":"undangan.pdf",
+#   "dibuat_at":"...","diubah_at":"..."},
+#  "penerima":[{"id_eksternal":"901","akun":"admin1","nomor":"08123456789","status":"terkirim","error":null,
+#   "id_pesan":"3EB0...","dikirim_at":"2026-11-06T02:00:15.000Z"}, ...]}
+```
+
+### Hasil kirim (feed)
+
+Pola sama dengan `/status-pesan` (simpan `cursor_terakhir`, ulangi selama `ada_lagi`, `tunggu` maks 30).
+Disimpan di MySQL (30 hari), jadi tidak hilang saat restart. Item dengan `penerima_id_eksternal: null` adalah
+perubahan status broadcast (`jeda`, `berjalan`, `selesai`, `dibatalkan`), catatannya di `error`.
+Status penerima di feed: `terkirim`, `gagal`, `dilewati`, `dibatalkan`, dan `menunggu` (setelah `/lanjut`).
+
+```sh
+curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/hasil-kirim?sejak=0&tunggu=25"
+# {"hasil":[{"cursor":1793971428266000,"broadcast_id_eksternal":"45","penerima_id_eksternal":"901",
+#   "akun":"admin1","status":"terkirim","error":null,"id_pesan":"3EB0...","waktu":"..."}],
+#  "cursor_terakhir":1793971428266000,"ada_lagi":false}
+```
+
+### Pengaturan dan statistik
+
+Berlaku langsung tanpa restart. Boleh kirim sebagian field. Bilangan bulat >= 1, `jam_mulai` 0-23,
+`jam_selesai` 1-24 dan lebih besar dari `jam_mulai`, `jeda_maks >= jeda_min`.
+
+```sh
+curl -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/pengaturan
+curl -X PUT -H "X-Secret-Key: $SECRET_KEY" -H "Content-Type: application/json" \
+  -d '{"batas_harian":150,"jeda_min":15,"jeda_maks":45,"istirahat_setiap":25,"jam_mulai":8,"jam_selesai":17,"gagal_beruntun":3}' \
+  http://127.0.0.1:8086/pengaturan
+
+curl -H "X-Secret-Key: $SECRET_KEY" http://127.0.0.1:8086/statistik
+# {"per_akun":{"admin1":{"terkirim_hari_ini":42,"antrean":108,"terakhir_kirim":"2026-11-06T03:10:00.000Z"}},
+#  "antrean_total":108}
+```
+
+### Migrasi (server PM2)
+
+Gateway bisa dideploy lebih dulu: endpoint lama tidak berubah, dan tanpa database endpoint broadcast hanya
+membalas `503`.
+
+1. Buat database dan user MySQL:
+   ```sql
+   CREATE DATABASE wa_api CHARACTER SET utf8mb4;
+   CREATE USER 'wa_api'@'localhost' IDENTIFIED BY '<password>';
+   GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, INDEX, REFERENCES ON wa_api.* TO 'wa_api'@'localhost';
+   ```
+2. Isi `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` di `.env`.
+3. `git pull && npm install && npx pm2 restart wa-api`. Log harus berisi `[broadcast] siap`
+   (tabel `broadcast`, `broadcast_penerima`, `pengaturan`, `hasil_kirim` dibuat otomatis).
+4. Tambahkan path ini ke reverse proxy Apache (sama seperti path lain yang sudah diteruskan):
+   `/broadcast`, `/broadcast/*`, `/hasil-kirim`, `/pengaturan`, `/statistik`.
+5. Samakan `PUT /pengaturan` dengan pengaturan broadcast yang sekarang di aplikasi.
+6. Baru setelah itu ubah aplikasi untuk memakai endpoint ini.
+
 ## Manajemen akun
 
 Daftar akun dan flag inbox disimpan di `auth/akun.json` (ikut volume `auth/`, tetap ada setelah restart).

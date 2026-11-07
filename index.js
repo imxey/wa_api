@@ -15,11 +15,20 @@ const {
   decryptPollVote,
 } = require("baileys");
 const QRCode = require("qrcode");
+const broadcast = require("./broadcast");
 
-// node index.js --self-check: test the poll vote decoding, before anything below touches disk or WhatsApp
+// node index.js --self-check: test the poll vote decoding and the broadcast scheduler, before anything
+// below touches disk or WhatsApp
 if (process.argv[2] === "--self-check") {
   selfCheck();
-  process.exit(0);
+  broadcast.selfCheck({ toJid }).then(
+    () => process.exit(0),
+    (err) => {
+      console.error(err);
+      process.exit(1);
+    },
+  );
+  return; // CommonJS allows a top-level return: nothing below may run while the async checks do
 }
 
 const PORT = process.env.PORT || 8086;
@@ -933,6 +942,8 @@ function startWebServer() {
         if (akunPath && req.method === "POST" && akunPath[2]) {
           return await handleInbox(req, res, decodeURIComponent(akunPath[1]));
         }
+        // /broadcast, /hasil-kirim, /pengaturan, /statistik
+        if (await broadcast.tangani(req, res)) return;
         // QR page is for direct access only (localhost/SSH tunnel). Apache always adds
         // X-Forwarded-For, so anything proxied gets a plain 404 instead of a login prompt
         if (req.headers["x-forwarded-for"]) {
@@ -1098,3 +1109,18 @@ async function connectToWhatsApp(id) {
 
 startWebServer();
 for (const id of accounts.keys()) connect(id);
+broadcast.mulai({
+  accounts,
+  toJid,
+  queueSent,
+  sendJson,
+  readBody,
+  isValidSecret,
+  nextCursor,
+  // Feed cursors stored in MySQL must stay ahead of the in-memory counter after a restart
+  seedCursor: (c) => (lastCursor = Math.max(lastCursor, c)),
+  wake,
+  waitForPush,
+  MAX_WAIT_S,
+  PAGE_SIZE,
+});
