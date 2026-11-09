@@ -32,6 +32,31 @@ const DEFAULT = {
 };
 const ERR_TIDAK_PASTI = "Proses berhenti saat mengirim, mungkin sudah terkirim";
 
+// Message text sits encrypted in MySQL (AES-256-GCM, key WA_DATA_KEY) so a DB dump/backup doesn't expose
+// chats; rows that no longer need it (sent, skipped, cancelled) are emptied. "wa1:" marks encrypted text.
+// Losing WA_DATA_KEY only loses messages still queued; keep a copy anyway.
+const AWALAN = "wa1:";
+function kunciData() {
+  const k = Buffer.from(String(process.env.WA_DATA_KEY || "").replace(/^base64:/, ""), "base64");
+  if (k.length !== 32) throw new Error("WA_DATA_KEY belum diisi / bukan 32 byte (format base64:...)");
+  return k;
+}
+function tutup(teks) {
+  if (!teks || teks.startsWith(AWALAN)) return teks;
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", kunciData(), iv);
+  const isi = Buffer.concat([c.update(teks, "utf8"), c.final()]);
+  return AWALAN + Buffer.concat([iv, c.getAuthTag(), isi]).toString("base64");
+}
+function buka(teks) {
+  if (!teks || !teks.startsWith(AWALAN)) return teks; // rows queued before encryption
+  const b = Buffer.from(teks.slice(AWALAN.length), "base64");
+  const dc = crypto.createDecipheriv("aes-256-gcm", kunciData(), b.subarray(0, 12));
+  dc.setAuthTag(b.subarray(12, 28));
+  return Buffer.concat([dc.update(b.subarray(28)), dc.final()]).toString("utf8");
+}
+const KOSONGKAN_SELESAI = "UPDATE broadcast_penerima SET pesan = '' WHERE status IN ('terkirim','dilewati','dibatalkan') AND pesan <> ''";
+
 let d = null; // deps from index.js
 let pool = null;
 let siap = false;
@@ -249,10 +274,11 @@ async function statAkun(akun, now) {
 // Same rule for every attachment: a photo stays a photo, anything else goes as a document, and the
 // message is the caption (POST /send's buildContent would send audio without its text)
 async function isiPesan(p) {
-  if (!p.lampiran_path) return { text: p.pesan };
+  const pesan = buka(p.pesan);
+  if (!p.lampiran_path) return { text: pesan };
   const buffer = await fs.promises.readFile(p.lampiran_path);
-  if (p.lampiran_mime.startsWith("image/")) return { image: buffer, caption: p.pesan };
-  return { document: buffer, mimetype: p.lampiran_mime, fileName: p.lampiran_nama, caption: p.pesan };
+  if (p.lampiran_mime.startsWith("image/")) return { image: buffer, caption: pesan };
+  return { document: buffer, mimetype: p.lampiran_mime, fileName: p.lampiran_nama, caption: pesan };
 }
 
 // One turn of an account's loop: send at most one message. Returns how long (ms) to sleep after.
@@ -336,7 +362,7 @@ async function catatKirim(conn, feed, p, idPesan, error) {
   } else {
     const now = sekarang();
     await conn.query(
-      "UPDATE broadcast_penerima SET status = 'terkirim', error = NULL, dikirim_at = ?, diubah_at = ? WHERE id = ?",
+      "UPDATE broadcast_penerima SET status = 'terkirim', pesan = '', error = NULL, dikirim_at = ?, diubah_at = ? WHERE id = ?",
       [now, now, p.id],
     );
     feed.push({ ...item, status: "terkirim", error: null, id_pesan: idPesan });
@@ -417,7 +443,19 @@ async function bersihkan() {
       await conn.query("UPDATE broadcast SET lampiran_path = NULL WHERE id = ?", [r.id]);
     }
     await conn.query("DELETE FROM hasil_kirim WHERE waktu < ?", [new Date(d.jam() - SIMPAN_HASIL_HARI * HARI)]);
+    await conn.query(KOSONGKAN_SELESAI); // skipped/cancelled rows (sent ones are emptied right away)
   });
+}
+
+// Rows queued before encryption existed: those still to send (or retry) get encrypted, the rest emptied.
+// Idempotent, runs at every start.
+async function enkripsiLama() {
+  await pool.query(KOSONGKAN_SELESAI);
+  for (;;) {
+    const [rows] = await pool.query("SELECT id, pesan FROM broadcast_penerima WHERE pesan <> '' AND pesan NOT LIKE 'wa1:%' LIMIT 500");
+    if (!rows.length) return;
+    for (const r of rows) await pool.query("UPDATE broadcast_penerima SET pesan = ? WHERE id = ?", [tutup(r.pesan), r.id]);
+  }
 }
 
 const teks = (v, maks = 64) =>
@@ -443,7 +481,7 @@ async function buatBroadcast(data, file) {
     }
     if (ids.has(px)) return [400, { error: `Bad Request: id_eksternal penerima ganda: ${px}` }];
     ids.add(px);
-    rows.push([px, akun, nomor, pesan]);
+    rows.push([px, akun, nomor, tutup(pesan)]);
   }
   const isiFile = file && Buffer.from(await file.arrayBuffer());
 
@@ -676,10 +714,16 @@ function mulai(deps) {
   if (!process.env.DB_HOST || !process.env.DB_NAME) {
     return console.log("[broadcast] nonaktif: DB_HOST/DB_NAME belum diisi, endpoint broadcast membalas 503");
   }
+  try {
+    kunciData();
+  } catch (err) {
+    return console.log(`[broadcast] nonaktif: ${err.message}, endpoint broadcast membalas 503`);
+  }
   // The gateway must keep serving the old endpoints when MySQL is down, so this only retries
   (async function coba() {
     try {
       await siapkan(process.env.DB_NAME);
+      await enkripsiLama();
       await pulihkan();
     } catch (err) {
       console.error("[broadcast] database belum siap, coba lagi 10 detik:", err.message);
@@ -718,6 +762,16 @@ async function selfCheck({ toJid }) {
   assert.ok(cekPengaturan({ ...p0, batas_harian: 0 }));
   assert.ok(cekPengaturan({ ...p0, jam_selesai: 25 }));
   assert.strictEqual(cekPengaturan({ ...p0, jam_mulai: 0, jam_selesai: 24 }), null);
+
+  // Stored message encryption (a throwaway key when none is set)
+  process.env.WA_DATA_KEY ||= "base64:" + crypto.randomBytes(32).toString("base64");
+  const rahasia = "Halo Bu 📌 NPSN 12345";
+  assert.ok(tutup(rahasia).startsWith(AWALAN) && !tutup(rahasia).includes("NPSN"));
+  assert.notStrictEqual(tutup(rahasia), tutup(rahasia)); // fresh IV each time
+  assert.strictEqual(buka(tutup(rahasia)), rahasia);
+  assert.strictEqual(tutup(tutup(rahasia)).length, tutup(rahasia).length); // never encrypted twice
+  assert.strictEqual(buka("teks lama"), "teks lama");
+  assert.strictEqual(tutup(""), "");
 
   const db = process.env.SELFCHECK_DB_NAME;
   if (!db) return console.log("broadcast self-check (jadwal) OK; skenario DB dilewati: isi SELFCHECK_DB_NAME");
@@ -775,6 +829,8 @@ async function selfCheck({ toJid }) {
     const [k2, r2] = await buatBroadcast(b1, null);
     assert.deepStrictEqual([k2, r2.id, r2.total], [200, r1.id, 5]);
     assert.strictEqual((await status("B1")).penerima.length, 5);
+    const [[mentah]] = await pool.query("SELECT pesan FROM broadcast_penerima WHERE id_eksternal = '1' AND broadcast_id = ?", [r1.id]);
+    assert.ok(mentah.pesan.startsWith(AWALAN) && !mentah.pesan.includes("halo")); // stored encrypted
     assert.strictEqual((await buatBroadcast({ id_eksternal: "X", penerima: [pn("1", "a1"), pn("1", "a1")] }))[0], 400);
     assert.strictEqual((await buatBroadcast({ id_eksternal: "X", penerima: Array.from({ length: 5001 }, (_, i) => pn(String(i), "a1")) }))[0], 400);
 
@@ -782,6 +838,8 @@ async function selfCheck({ toJid }) {
     assert.strictEqual(await langkah("a1"), 0);
     assert.deepStrictEqual(kirim.at(-1).content, { text: "halo 1" });
     assert.strictEqual(kirim.at(-1).jid, "6281@s.whatsapp.net"); // same number format as /send
+    const [[terkirim]] = await pool.query("SELECT pesan FROM broadcast_penerima WHERE id_eksternal = '1' AND broadcast_id = ?", [r1.id]);
+    assert.strictEqual(terkirim.pesan, ""); // emptied once sent
     assert.ok(dicatat.includes(kirim.at(-1).id)); // went through queueSent like /send
     assert.strictEqual(await langkah("a1"), 15_000);
     assert.strictEqual(await langkah("a2"), 0);

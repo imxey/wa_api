@@ -138,7 +138,10 @@ membalas `503`.
    CREATE USER 'wa_api'@'localhost' IDENTIFIED BY '<password>';
    GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, INDEX, REFERENCES ON wa_api.* TO 'wa_api'@'localhost';
    ```
-2. Isi `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` di `.env`.
+2. Isi `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` di `.env`, ditambah `WA_DATA_KEY`
+   (kunci enkripsi isi pesan di MySQL, buat sekali: `node -e "console.log('base64:'+require('crypto').randomBytes(32).toString('base64'))"`).
+   Tanpa `WA_DATA_KEY` endpoint broadcast membalas 503. Jangan diganti selama masih ada antrean: pesan yang belum terkirim
+   tidak bisa dibuka lagi. Folder `auth/` (sesi WhatsApp) jangan ikut backup tanpa enkripsi: isinya bisa membajak akun.
 3. `git pull && npm install && npx pm2 restart wa-api`. Log harus berisi `[broadcast] siap`
    (tabel `broadcast`, `broadcast_penerima`, `pengaturan`, `hasil_kirim` dibuat otomatis).
 4. Tambahkan path ini ke reverse proxy Apache (sama seperti path lain yang sudah diteruskan):

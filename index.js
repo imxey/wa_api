@@ -668,6 +668,16 @@ async function handleHapusAkun(req, res, id) {
   sendJson(res, 200, { success: true });
 }
 
+// Turning the inbox off is the owner withdrawing consent: chats of that account still in memory go too
+function lupakanInbox(akun) {
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (queue[i].akun === akun) {
+      waMsgs.delete(queue[i].cursor);
+      queue.splice(i, 1);
+    }
+  }
+}
+
 // POST /akun/<akun>/inbox {"inbox": true|false}: whether incoming chats are queued for GET /pesan-masuk
 async function handleInbox(req, res, id) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
@@ -683,6 +693,7 @@ async function handleInbox(req, res, id) {
   }
   acc.inbox = inbox;
   saveStore();
+  if (!inbox) lupakanInbox(id);
   sendJson(res, 200, { success: true, ...akunJson(id) });
 }
 
