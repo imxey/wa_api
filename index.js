@@ -742,6 +742,37 @@ async function handlePesanMasuk(req, res) {
   sendJson(res, 200, { pesan, ...info });
 }
 
+// The calling app keeps no copy of chats (they stay only here, in memory), so it asks per page view:
+// GET /percakapan?akun=<akun>: one row per chat partner (last message, count, newest incoming cursor).
+// GET /percakapan?akun=<akun>&nomor=<nomor|jid>: the queued messages of that chat, oldest first (max 200).
+async function handlePercakapan(req, res) {
+  if (!isValidSecret(req.headers["x-secret-key"])) {
+    return sendJson(res, 401, { error: "Unauthorized: Invalid secret key" });
+  }
+  const q = new URL(req.url, "http://localhost").searchParams;
+  const akun = q.get("akun") || "";
+  if (!accounts.has(akun)) {
+    return sendJson(res, 400, { error: "Bad Request: akun tidak dikenal" });
+  }
+  const milik = queue.filter((p) => p.akun === akun);
+  const nomor = q.get("nomor");
+  if (nomor) {
+    const pesan = milik.filter((p) => p.nomor_pengirim === nomor || p.jid_pengirim === nomor).slice(-200);
+    return sendJson(res, 200, { pesan });
+  }
+  const per = new Map();
+  for (const p of milik) { // queue is in cursor order: the last one seen per chat is the newest
+    const k = p.nomor_pengirim || p.jid_pengirim;
+    const c = per.get(k) || { nomor_pengirim: p.nomor_pengirim, jid_pengirim: p.jid_pengirim, nama_pengirim: null, jml_pesan: 0, cursor_masuk: 0 };
+    c.jml_pesan++;
+    c.nama_pengirim = p.nama_pengirim || c.nama_pengirim;
+    c.terakhir = p;
+    if (p.arah !== "keluar") c.cursor_masuk = p.cursor;
+    per.set(k, c);
+  }
+  sendJson(res, 200, { percakapan: [...per.values()], jml_pesan: milik.length });
+}
+
 // GET /hasil-polling?sejak=<cursor>: votes on polls sent via POST /polling
 async function handleHasilPolling(req, res) {
   if (!isValidSecret(req.headers["x-secret-key"])) {
@@ -921,6 +952,9 @@ function startWebServer() {
         }
         if (req.method === "GET" && req.url.split("?")[0] === "/pesan-masuk") {
           return await handlePesanMasuk(req, res);
+        }
+        if (req.method === "GET" && req.url.split("?")[0] === "/percakapan") {
+          return await handlePercakapan(req, res);
         }
         if (req.method === "GET" && req.url.split("?")[0] === "/media") {
           return await handleMedia(req, res);

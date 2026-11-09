@@ -187,6 +187,23 @@ curl -X POST http://127.0.0.1:8086/akun/admin9/inbox \
 ```
 
 `GET /status` menampilkan field `dibuat_at` per akun, di samping `akun`, `ready`, `inbox`, `nomor`, `qr`.
+Mematikan inbox juga menghapus chat akun itu yang masih ada di memori.
+
+## Percakapan (dipakai halaman chat aplikasi)
+
+Aplikasi tidak menyimpan salinan chat; setiap tampilan bertanya ke sini. Chat hanya ada di memori gateway.
+
+```bash
+# daftar: satu baris per lawan bicara (pesan terakhir, jumlah pesan, cursor pesan masuk terbaru)
+curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/percakapan?akun=pic-demo"
+# {"percakapan":[{"nomor_pengirim":"6281...","jid_pengirim":"...","nama_pengirim":"Budi","jml_pesan":3,"cursor_masuk":...,"terakhir":{...item pesan-masuk...}}],"jml_pesan":3}
+
+# isi satu percakapan (nomor atau jid @lid), lama ke baru, maks 200
+curl -H "X-Secret-Key: $SECRET_KEY" "http://127.0.0.1:8086/percakapan?akun=pic-demo&nomor=6281234567890"
+# {"pesan":[...item pesan-masuk...]}
+```
+
+Path `/percakapan` harus ikut diteruskan reverse proxy Apache.
 
 ## Reply, forward, stiker, media
 
